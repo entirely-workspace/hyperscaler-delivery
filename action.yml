@@ -1,0 +1,60 @@
+name: Deliver to censhare HyperScaler
+description: >
+  Delivers this commit's customization package to a censhare HyperScaler customer: stores it once in the customer's
+  package store, by digest, and activates it in the delegated stage's cell (dev or test), then reports the cell's
+  answer. It signs in as the publisher role the customer delegated to this repository and branch: the workflow needs
+  `permissions: id-token: write`, and no key is stored anywhere. Prod is never delivered by a pipeline; it takes the
+  customer's approval. See README.md.
+inputs:
+  customer:
+    description: The customer id censhare gave you.
+    required: true
+  packages-bucket:
+    description: The customer's package store (its PackagesBucket).
+    required: true
+  publisher-role:
+    description: The publisher role delegated to this repository and branch (its ARN).
+    required: true
+  stage:
+    description: dev or test, as delegated.
+    default: dev
+  activate:
+    description: next-boot (the cell takes the package at its next restart) or now (needs reason).
+    default: next-boot
+  reason:
+    description: Why now. Required with activate now; kept in the cell's record.
+    default: ''
+  region:
+    description: The package store's AWS region.
+    default: eu-central-1
+  working-directory:
+    description: The folder with customization.json.
+    default: .
+  wait-minutes:
+    description: How long to wait for the cell's answer.
+    default: '20'
+runs:
+  using: composite
+  steps:
+    # The OIDC token GitHub signs for this workflow becomes the publisher role: the customer's delegation decides which
+    # repository and branch may, for which stages.
+    # Pinned to a commit: this Action is public and runs as the customer's publisher role, so a moved tag upstream
+    # can't change what a tagged edition runs.
+    - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd   # v6.3.0
+      with:
+        role-to-assume: ${{ inputs.publisher-role }}
+        aws-region: ${{ inputs.region }}
+        role-session-name: censhare-deliver-${{ github.run_id }}
+
+    - name: Store, activate, and wait for the cell's answer
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        CUSTOMER: ${{ inputs.customer }}
+        PACKAGES_BUCKET: ${{ inputs.packages-bucket }}
+        STAGE: ${{ inputs.stage }}
+        ACTIVATE: ${{ inputs.activate }}
+        REASON: ${{ inputs.reason }}
+        WAIT_MINUTES: ${{ inputs.wait-minutes }}
+        GH_TOKEN: ${{ github.token }}   # read-only: whether this commit is still the branch's tip (deliver.sh)
+      run: bash "$GITHUB_ACTION_PATH/bin/deliver.sh"
