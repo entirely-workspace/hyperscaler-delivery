@@ -2,7 +2,7 @@
 
 This repository is yours: it holds your censhare customization package and delivers it, from your own CI, to the
 censhare HyperScaler cells of the customer you work for. censhare keeps no copy of your source. Copied from the
-`starter/` folder of the censhare partner kit v2026.11.10-0b1dad20.
+`starter/` folder of the censhare partner kit v2026.11.10-5175fe78.
 
 ## Make it yours
 1. In `customization.json`, set `vendor` to the vendor id censhare gave you and `package` to your package's name.
@@ -28,4 +28,4 @@ Each push stores the package once, by its digest, and activates it in the branch
 is delivered: a re-run of an older push ends green and delivers nothing. Prod is never delivered by a pipeline: the
 customer approves the package test ran. The pipeline fails with the cell's reason when the cell refuses a package.
 
-The guide: the `README.md` of the partner kit, at the same version.
+The guide: `GUIDE.md` of the partner kit, at the same version (wiring up the pipeline: its `README.md`).

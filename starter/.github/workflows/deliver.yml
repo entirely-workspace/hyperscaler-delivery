@@ -1,5 +1,5 @@
 name: Deliver to censhare
-# censhare HyperScaler partner kit v2026.11.10-0b1dad20. Each push to a delegated branch stores this commit's package once, by
+# censhare HyperScaler partner kit v2026.11.10-5175fe78. Each push to a delegated branch stores this commit's package once, by
 # digest, in the customer's package store and activates it in that branch's stage: main → dev, test → test (only if
 # the customer delegated test to you). Prod is never delivered by a pipeline: the customer approves the package test ran.
 on:
@@ -31,7 +31,7 @@ jobs:
           [ -n "${!ROLE_VAR}" ] && exit 0
           echo "::error::Set the repository variable $ROLE_VAR to the publisher role the customer gave you for $GITHUB_REF_NAME (Settings → Secrets and variables → Actions → Variables)."
           exit 1
-      - uses: entirely-workspace/hyperscaler-delivery@v2026.11.10-0b1dad20
+      - uses: entirely-workspace/hyperscaler-delivery@v2026.11.10-5175fe78
         with:
           customer: ${{ vars.CENSHARE_CUSTOMER }}
           packages-bucket: ${{ vars.CENSHARE_PACKAGES_BUCKET }}

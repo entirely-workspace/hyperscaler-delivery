@@ -1,10 +1,10 @@
-# censhare HyperScaler partner kit v2026.11.10-0b1dad20. Each push to a delegated branch stores this commit's package once, by
+# censhare HyperScaler partner kit v2026.11.10-5175fe78. Each push to a delegated branch stores this commit's package once, by
 # digest, in the customer's package store and activates it in that branch's stage: main → dev, test → test (only if
 # the customer delegated test to you). Prod is never delivered by a pipeline: the customer approves the package test ran.
 # CI/CD variables: CENSHARE_CUSTOMER, CENSHARE_PACKAGES_BUCKET, CENSHARE_PUBLISHER_ROLE (main's), and
 # CENSHARE_PUBLISHER_ROLE_TEST if test is delegated: each delegated branch has its own role, which trusts that branch only.
 include:
-  - remote: https://raw.githubusercontent.com/entirely-workspace/hyperscaler-delivery/v2026.11.10-0b1dad20/gitlab/deliver.gitlab-ci.yml
+  - remote: https://raw.githubusercontent.com/entirely-workspace/hyperscaler-delivery/v2026.11.10-5175fe78/gitlab/deliver.gitlab-ci.yml
 
 deliver-dev:
   extends: .censhare-deliver

@@ -1,4 +1,4 @@
-# censhare HyperScaler partner kit v2026.11.10-0b1dad20: deliver this commit's customization package from GitLab CI.
+# censhare HyperScaler partner kit v2026.11.10-5175fe78: deliver this commit's customization package from GitLab CI.
 #
 # Include this file and extend .censhare-deliver in a job that runs on the branch the customer delegated (README.md):
 # GitLab vouches for the job with its OIDC token, which becomes the publisher role; no key is stored. The package is
@@ -23,7 +23,7 @@
     # python3: the kit checks the package as the cell does before storing it (bin/validate.sh).
     - yum install -q -y git jq python3 >/dev/null
     # The kit at this template's own version: the scripts it was tested with.
-    - git clone -q --depth 1 --branch "v2026.11.10-0b1dad20" "$CENSHARE_KIT" "$CENSHARE_KIT_DIR"
+    - git clone -q --depth 1 --branch "v2026.11.10-5175fe78" "$CENSHARE_KIT" "$CENSHARE_KIT_DIR"
   script:
     - export AWS_REGION="$CENSHARE_REGION" AWS_DEFAULT_REGION="$CENSHARE_REGION"
     - creds=$(aws sts assume-role-with-web-identity --role-arn "$CENSHARE_PUBLISHER_ROLE" --role-session-name "gitlab-$CI_JOB_ID" --web-identity-token "$CENSHARE_OIDC" --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text)

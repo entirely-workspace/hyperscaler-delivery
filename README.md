@@ -7,6 +7,8 @@ Prod is never delivered by a pipeline. It runs only a package test accepted, onc
 
 This kit is versioned with each censhare edition: use the tag of the edition your customer runs.
 
+The whole path, from getting a delegation to promotion, hotfix and rollback, is in [GUIDE.md](GUIDE.md).
+
 ## Start from the starter
 The kit's `starter/` folder is a repository to copy into your own git, on GitHub or GitLab: a package to rename
 (`customization.json`, `censhare-Custom/censhare-Server/app/modules/your-vendor/`) and both pipelines, already at this
