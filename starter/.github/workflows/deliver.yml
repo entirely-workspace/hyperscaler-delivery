@@ -1,0 +1,42 @@
+name: Deliver to censhare
+# censhare HyperScaler partner kit v2026.11.10-0b1dad20. Each push to a delegated branch stores this commit's package once, by
+# digest, in the customer's package store and activates it in that branch's stage: main → dev, test → test (only if
+# the customer delegated test to you). Prod is never delivered by a pipeline: the customer approves the package test ran.
+on:
+  push:
+    branches: [main, test]
+  workflow_dispatch:
+    inputs:
+      activate: { description: "next-boot or now", default: next-boot }
+      reason: { description: "Why now (needed for now)", default: "" }
+# GitHub vouches for this workflow with its OIDC token; no key is stored.
+permissions: { id-token: write, contents: read }
+concurrency:
+  group: censhare-deliver-${{ github.ref_name }}
+  cancel-in-progress: false
+jobs:
+  deliver:
+    # Only the delegated branches: a run dispatched on another ref would say dev and then be refused by AWS.
+    if: github.ref_name == 'main' || github.ref_name == 'test'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # The branch's role must be set: otherwise AWS only says "not authorized" (and test would try main's role).
+      - name: Check the publisher role variable
+        env:
+          ROLE_VAR: ${{ github.ref_name == 'test' && 'CENSHARE_PUBLISHER_ROLE_TEST' || 'CENSHARE_PUBLISHER_ROLE' }}
+          CENSHARE_PUBLISHER_ROLE: ${{ vars.CENSHARE_PUBLISHER_ROLE }}
+          CENSHARE_PUBLISHER_ROLE_TEST: ${{ vars.CENSHARE_PUBLISHER_ROLE_TEST }}
+        run: |
+          [ -n "${!ROLE_VAR}" ] && exit 0
+          echo "::error::Set the repository variable $ROLE_VAR to the publisher role the customer gave you for $GITHUB_REF_NAME (Settings → Secrets and variables → Actions → Variables)."
+          exit 1
+      - uses: entirely-workspace/hyperscaler-delivery@v2026.11.10-0b1dad20
+        with:
+          customer: ${{ vars.CENSHARE_CUSTOMER }}
+          packages-bucket: ${{ vars.CENSHARE_PACKAGES_BUCKET }}
+          # Each delegated branch has its own role (it trusts that branch only): test's is CENSHARE_PUBLISHER_ROLE_TEST.
+          publisher-role: ${{ github.ref_name == 'test' && vars.CENSHARE_PUBLISHER_ROLE_TEST || vars.CENSHARE_PUBLISHER_ROLE }}
+          stage: ${{ github.ref_name == 'test' && 'test' || 'dev' }}
+          activate: ${{ inputs.activate || 'next-boot' }}
+          reason: ${{ inputs.reason }}

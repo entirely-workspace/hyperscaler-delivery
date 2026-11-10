@@ -1,0 +1,30 @@
+# censhare HyperScaler partner kit v2026.11.10-0b1dad20. Each push to a delegated branch stores this commit's package once, by
+# digest, in the customer's package store and activates it in that branch's stage: main → dev, test → test (only if
+# the customer delegated test to you). Prod is never delivered by a pipeline: the customer approves the package test ran.
+# CI/CD variables: CENSHARE_CUSTOMER, CENSHARE_PACKAGES_BUCKET, CENSHARE_PUBLISHER_ROLE (main's), and
+# CENSHARE_PUBLISHER_ROLE_TEST if test is delegated: each delegated branch has its own role, which trusts that branch only.
+include:
+  - remote: https://raw.githubusercontent.com/entirely-workspace/hyperscaler-delivery/v2026.11.10-0b1dad20/gitlab/deliver.gitlab-ci.yml
+
+deliver-dev:
+  extends: .censhare-deliver
+  variables: { CENSHARE_STAGE: dev }
+  # The branch's role must be set: otherwise AWS only says "not authorized".
+  before_script:
+    - '[ -n "$CENSHARE_PUBLISHER_ROLE" ] || { echo "Set the CI/CD variable CENSHARE_PUBLISHER_ROLE to the publisher role the customer gave you for main."; exit 1; }'
+    - !reference [.censhare-deliver, before_script]
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push"
+  resource_group: censhare-deliver-dev
+
+deliver-test:
+  extends: .censhare-deliver
+  variables: { CENSHARE_STAGE: test }
+  # test's own role. Set in the shell, not in variables: a project's CI/CD variable would win over a job's variables.
+  before_script:
+    - '[ -n "$CENSHARE_PUBLISHER_ROLE_TEST" ] || { echo "Set the CI/CD variable CENSHARE_PUBLISHER_ROLE_TEST to the publisher role the customer gave you for test."; exit 1; }'
+    - !reference [.censhare-deliver, before_script]
+    - export CENSHARE_PUBLISHER_ROLE="$CENSHARE_PUBLISHER_ROLE_TEST"
+  rules:
+    - if: $CI_COMMIT_BRANCH == "test" && $CI_PIPELINE_SOURCE == "push"
+  resource_group: censhare-deliver-test

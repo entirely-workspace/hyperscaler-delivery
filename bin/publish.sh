@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Publish a partner's customization package to a cell's intake, or roll the cell back to one already published (#345),
-# and store it in a customer's package store (#780). The one script for every path: a partner's CI runs it (the
-# hyperscaler-partner-publish GitHub action keeps a copy its CI compares with this one), and a customer's activations
-# (lib/customer-customization-stack.ts) run it to place a stored package into a cell. Everything a cell runs is
+# and store it in a customer's package store (#780). The one script for every path: a delegated partner pipeline runs
+# its own copy, next to deliver.sh in its repository (docs/RUNBOOK.md, #779 and #826), and a customer's activations
+# (lib/customer-customization-stack.ts) run it to place a stored package into a cell. The hyperscaler-partner-publish
+# GitHub action keeps an older copy that publishes straight to a cell (#346) and never stores. Everything a cell runs is
 # checked and signed by the cell itself (its intake): this script only delivers the package and reports the cell's
 # answer.
 #
@@ -12,6 +13,8 @@
 #
 # The package store (#780), PACKAGES_BUCKET, keyed by digest:
 #   <vendor>/packages/<hex>/files/<path>, manifest.json   the package, written once, never replaced
+#   <vendor>/packages/<hex>/stored-by/<role>.json         who stored it, written once before the manifest; a publisher
+#                                                         role may write only its own name (decision 0023)
 #   <vendor>/packages/<hex>/<stage>-result.json           the stage cell's last answer for it (test's is acceptance)
 #   <vendor>/versions/<package>/<commit>.json             the commit's digest
 #   <vendor>/packages/<hex>/prod-approval.json            the customer's approval for prod (#781), written once
@@ -92,10 +95,13 @@ sha256() { if command -v sha256sum >/dev/null; then sha256sum "$@"; else shasum 
 summary() { [ -n "${GITHUB_STEP_SUMMARY:-}" ] && printf '%s\n' "$@" >> "$GITHUB_STEP_SUMMARY"; return 0; }
 output() { [ -n "${GITHUB_OUTPUT:-}" ] && printf '%s=%s\n' "$1" "$2" >> "$GITHUB_OUTPUT"; return 0; }
 
-# tip: the commit BRANCH points at now, or nothing when it cannot be read.
+# tip: the commit BRANCH points at now, or nothing when it cannot be read. BRANCH_TIP: the caller read it already (the
+# CodeCommit template reads it with its build role, before it signs in as a role of censhare's that can't, #886).
 tip() {
   local t=""
-  if [ -n "${REPOSITORY:-}" ]; then
+  if [[ "${BRANCH_TIP:-}" =~ $COMMIT_RE ]]; then
+    t=$BRANCH_TIP
+  elif [ -n "${REPOSITORY:-}" ]; then
     t=$(aws codecommit get-branch --repository-name "$REPOSITORY" --branch-name "$BRANCH" \
           --query branch.commitId --output text 2>/dev/null) || t=""
   elif [ -n "${GH_TOKEN:-}" ] && [ -n "${GITHUB_REPOSITORY:-}" ]; then
@@ -115,7 +121,7 @@ tip() {
 current() {
   local t; t=$(tip)
   if [ -z "$t" ]; then
-    [ "${GITHUB_ACTIONS:-}" = true ] || [ -n "${CODEBUILD_BUILD_ID:-}" ] \
+    [ "${GITHUB_ACTIONS:-}" = true ] || [ -n "${CODEBUILD_BUILD_ID:-}" ] || [ "${GITLAB_CI:-}" = true ] \
       && fail "could not read $BRANCH to check that $ID is its tip ($1)"
     echo "${W}could not read $BRANCH; publishing $ID without checking it is the latest (not in a job)"
     return 0
@@ -159,6 +165,21 @@ from_store() {
   echo "fetched $FROM_STORE ($n files, commit $STORE_COMMIT) from the store"
 }
 [ -n "${FROM_STORE:-}" ] && [ "$MODE" = run ] && from_store
+
+# test_gate: into test only a stored digest dev accepted, for the commit its manifest names (decision 0023). Whoever
+# started the run: the Control Center or a delegated pipeline promoting a stored version. Read before anything is sent.
+# A customer without a dev stage has no dev to accept anything: the buildspec says so (DEV_STAGE=no, out of an
+# override's reach), and only that exact value skips the check.
+test_gate() {
+  [ "${DEV_STAGE:-}" = no ] && { echo "no dev stage: test takes the stored version as it is"; return 0; }
+  local at="$STORE_VENDOR/packages/${FROM_STORE#sha256:}"
+  aws s3api get-object --bucket "$PACKAGES_BUCKET" --key "$at/dev-result.json" .dev-result.json >/dev/null 2>&1 \
+    && case "$(jq -r '.status // empty' .dev-result.json)" in published|activated) true ;; *) false ;; esac \
+    && [ "$(jq -r '.version // empty' .dev-result.json)" = "$STORE_COMMIT" ] \
+    || { rm -f .dev-result.json; fail "dev has not accepted $FROM_STORE (commit $STORE_COMMIT): activate it on dev first"; }
+  rm -f .dev-result.json
+  echo "accepted by dev"
+}
 
 # prod_gate: into prod only a digest the test cell accepted and the customer approved (#781). Read before anything is
 # sent; the same rule for a hotfix and for a rollback, which is promoting an earlier digest.
@@ -208,6 +229,7 @@ elif [ -n "${FROM_STORE:-}" ] && [ "$MODE" = run ]; then
   REQUEST=$(jq -nc --arg a "$ACTIVATE" --arg r "$REASON" \
     '{action: "publish", activate: $a} + (if $r == "" then {} else {reason: $r} end)')
   WHAT="publish $VENDOR/$PACKAGE $DIGEST @ $ID from the store (${#FILES[@]} files)"
+  [ "${STAGE:-}" = test ] && test_gate
   [ "${STAGE:-}" = prod ] && prod_gate
 else
   git rev-parse --git-dir >/dev/null 2>&1 || fail "not a git checkout: the version published is the commit"
@@ -267,8 +289,24 @@ store_package() {
     '{vendor: $v, package: $p, commit: $c, digest: $d,
       files: [split("\n")[] | select(length > 0) | capture("^(?<sha256>[0-9a-f]{64})  (?<path>.*)$")]}' > "$TMP/manifest.json"
   jq -n --arg d "$DIGEST" '{digest: $d}' > "$TMP/version.json"
-  printf '%s\0%s\0%s\0%s\0' "$at/manifest.json" "$TMP/manifest.json" "$VENDOR/versions/$PACKAGE/$ID.json" "$TMP/version.json" \
-    | ( BUCKET=$PACKAGES_BUCKET CELL_PROFILE= upload ) || fail "the package's manifest could not be stored"
+  # Who stored it, before the manifest: a revoked delegation's packages reach no cell (decision 0023). The role this runs
+  # as; the store lets a publisher role write only its own name, and only records dated no later than the manifest count.
+  # Not recorded (not a role, or a store that does not allow it yet): the package's publisher is unknown, which is refused
+  # once any delegation of the vendor is revoked, so leaving it out gains nothing.
+  local me publisher=""
+  me=$(aws sts get-caller-identity --query Arn --output text 2>/dev/null) || me=""
+  case "$me" in arn:aws*:sts::*:assumed-role/*/*) publisher=${me#*:assumed-role/}; publisher=${publisher%%/*} ;; esac
+  if [[ "$publisher" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+    jq -n --arg p "$publisher" '{publisher: $p}' > "$TMP/stored-by.json"
+    BUCKET=$PACKAGES_BUCKET CELL_PROFILE= bash "$0" __put "$at/stored-by/$publisher.json" "$TMP/stored-by.json" \
+      || echo "${W}who stored the package could not be recorded: it is refused once a delegation of $VENDOR is revoked" >&2
+  else
+    echo "${W}not running as a role: who stored the package is not recorded" >&2
+  fi
+  BUCKET=$PACKAGES_BUCKET CELL_PROFILE= bash "$0" __put "$at/manifest.json" "$TMP/manifest.json" \
+    || fail "the package's manifest could not be stored"
+  printf '%s\0%s\0' "$VENDOR/versions/$PACKAGE/$ID.json" "$TMP/version.json" \
+    | ( BUCKET=$PACKAGES_BUCKET CELL_PROFILE= upload ) || fail "the commit's pointer could not be stored"
   echo "stored $VENDOR/$PACKAGE @ $ID as $DIGEST (${#FILES[@]} files)"
   outcome stored
 }

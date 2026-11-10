@@ -1,0 +1,31 @@
+# censhare HyperScaler partner kit v2026.11.10-0b1dad20: deliver this commit's customization package from GitLab CI.
+#
+# Include this file and extend .censhare-deliver in a job that runs on the branch the customer delegated (README.md):
+# GitLab vouches for the job with its OIDC token, which becomes the publisher role; no key is stored. The package is
+# stored once, by digest, in the customer's package store and activated in the delegated stage's cell (dev or test).
+# Set CENSHARE_CUSTOMER, CENSHARE_PACKAGES_BUCKET and CENSHARE_PUBLISHER_ROLE as CI/CD variables of your project.
+.censhare-deliver:
+  # The image's entrypoint is aws: without the empty one, GitLab's runner would hand the job's shell to aws.
+  image:
+    name: public.ecr.aws/aws-cli/aws-cli:2.22.0
+    entrypoint: [""]
+  id_tokens:
+    CENSHARE_OIDC:
+      aud: sts.amazonaws.com
+  variables:
+    CENSHARE_STAGE: dev
+    CENSHARE_ACTIVATE: next-boot
+    CENSHARE_REASON: ""
+    CENSHARE_REGION: eu-central-1
+    CENSHARE_KIT: https://github.com/entirely-workspace/hyperscaler-delivery.git
+    CENSHARE_KIT_DIR: /tmp/censhare-kit
+  before_script:
+    # python3: the kit checks the package as the cell does before storing it (bin/validate.sh).
+    - yum install -q -y git jq python3 >/dev/null
+    # The kit at this template's own version: the scripts it was tested with.
+    - git clone -q --depth 1 --branch "v2026.11.10-0b1dad20" "$CENSHARE_KIT" "$CENSHARE_KIT_DIR"
+  script:
+    - export AWS_REGION="$CENSHARE_REGION" AWS_DEFAULT_REGION="$CENSHARE_REGION"
+    - creds=$(aws sts assume-role-with-web-identity --role-arn "$CENSHARE_PUBLISHER_ROLE" --role-session-name "gitlab-$CI_JOB_ID" --web-identity-token "$CENSHARE_OIDC" --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text)
+    - read -r AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN <<< "$creds" && export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+    - CUSTOMER="$CENSHARE_CUSTOMER" PACKAGES_BUCKET="$CENSHARE_PACKAGES_BUCKET" STAGE="$CENSHARE_STAGE" ACTIVATE="$CENSHARE_ACTIVATE" REASON="$CENSHARE_REASON" bash "$CENSHARE_KIT_DIR/bin/deliver.sh"
