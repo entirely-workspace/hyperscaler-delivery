@@ -47,12 +47,13 @@ files inside its jars and zips (not only owned paths; .git and symbolic links le
 it on a snapshot of a partner's censhare-Custom before it goes into a repository (#461): app/config and app/services,
 which a package never delivers, are where such a snapshot keeps its credentials.
 """
-import hashlib, json, os, re, subprocess, sys, zipfile
+import functools, hashlib, json, os, re, subprocess, sys, zipfile
 import xml.etree.ElementTree as ET
 
 V2_FIELDS = ('censhareVersion', 'hyperscalerContract', 'activation', 'touchesMasterdata', 'arch', 'requiresServices')
-KNOWN = {'vendor', 'package', 'source', 'owns', 'excludes', 'replaces', 'settings', 'secrets', 'client', *V2_FIELDS}   # settings: #343,
-# checked by docker/censhare-server/customer-settings.sh in publish-customization.sh and at boot; secrets: #450, below
+KNOWN = {'vendor', 'package', 'source', 'owns', 'excludes', 'replaces', 'settings', 'secrets', 'parameters', 'client',
+         *V2_FIELDS}   # settings: #343, checked by docker/censhare-server/customer-settings.sh in publish-customization.sh
+# and at boot; secrets: #450, below; parameters: #942 (decision 0025), below
 NAME = re.compile(r'^[a-z0-9_-]+$')
 VERSION_RANGE = re.compile(r'^(?:(?:>=|<=|>|<|=)?\d{4}\.\d+(?:\.\d+)*)(?: (?:>=|<=|>|<|=)?\d{4}\.\d+(?:\.\d+)*)*$')
 CONTRACT = 1   # the delivery contract this edition implements; publish-customization.sh writes it into manifest.json
@@ -70,6 +71,8 @@ def own_ok(p):
     if p in ('app/services', 'app/config') or p.startswith(('app/services/', 'app/config/')):
         return False
     if p == 'app/modules/hyperscaler' or p.startswith('app/modules/hyperscaler/'):
+        return False
+    if p == 'app/modules/event_forward_eventbridge' or p.startswith('app/modules/event_forward_eventbridge/'):
         return False
     if p.startswith(('app/web/src/hyperscaler', 'app/web/src/acme', 'app/web/src/ng1', 'app/web/sass')) \
             or p == 'app/web/cs' or p.startswith('app/web/cs/'):
@@ -224,9 +227,58 @@ def check_fields(spec, r, strict_fields):
         r.error('"requiresServices" must be a list of service names like ["renderer"]')
 
 SECRETS_MAX = 20   # CUSTOMER_SECRETS_MAX in docker/censhare-server/customer-secrets.sh
+PARAMETERS_MAX = 20   # CUSTOMER_PARAMETERS_MAX in docker/censhare-server/customer-parameters.sh
 SECRET_NAME = re.compile(r'^[a-z0-9][a-z0-9-]{0,62}$')
 SECRET_FILE = re.compile(r'^app/[A-Za-z0-9._/ -]+\.xml$')
 SECRET_ATTR = re.compile(r'^[A-Za-z_][A-Za-z0-9_.-]{0,63}$')
+# A `path` instead of `attribute` (#942 review): NAMED_VALUE_PATH_RE in docker/censhare-server/customer-secrets.sh, the
+# same string (tests/test-customer-secrets.sh compares them).
+NAMED_VALUE_PATH_RE = r"^(/[A-Za-z_][A-Za-z0-9_.-]{0,63}(\[@[A-Za-z_][A-Za-z0-9_.-]{0,63}='[A-Za-z0-9 ._:/+-]{0,200}'\]){0,3}){1,10}/@[A-Za-z_][A-Za-z0-9_.-]{0,63}$"
+NAMED_VALUE_PATH = re.compile(NAMED_VALUE_PATH_RE)
+
+
+def value_target(e):
+    """Where a named value goes, as the log and the rules name it: service <s> <path>, its path, or config@<attribute>."""
+    if 'service' in e:
+        return f'service {e.get("service")} {e.get("path")}'
+    return e.get('path') if 'path' in e else f'config@{e.get("attribute")}'
+
+
+SERVICE_NAME = re.compile(r'^[a-z][a-z0-9_-]{0,63}$')
+
+
+def service_values():
+    """The edition's service paths a value or secret may fill (#1094): CUSTOMER_SERVICE_VALUES of customer-settings.sh,
+    found as the intake bundles it (beside this file, or CUSTOMER_SETTINGS) or in the repository. None where there is no
+    such file (the partner kit): the cell checks a service entry then, and this only warns."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for f in (os.environ.get('CUSTOMER_SETTINGS') or '', os.path.join(here, 'customer-settings.sh'),
+              os.path.join(here, '..', 'docker', 'censhare-server', 'customer-settings.sh')):
+        if f and os.path.isfile(f):
+            return _service_values_in(os.path.abspath(f), os.path.getmtime(f))
+    return None
+
+
+@functools.lru_cache(maxsize=8)
+def _service_values_in(path, mtime):
+    """The list in one customer-settings.sh, read once per file and version of it (#1118 review)."""
+    with open(path, encoding='utf-8') as fh:
+        m = re.search(r'^CUSTOMER_SERVICE_VALUES="\n(.*?)^"', fh.read(), re.S | re.M)
+    return frozenset(line.strip() for line in (m.group(1).splitlines() if m else []) if line.strip())
+
+
+def path_elements(root, path):
+    """The elements of a parsed file that a checked `path` names (its last step, the attribute, left out)."""
+    steps = re.findall(r"/([A-Za-z_][A-Za-z0-9_.-]*)((?:\[@[^]]*\])*)", path.rsplit('/@', 1)[0])
+    def matches(el, preds):
+        return all(el.get(k) == v for k, v in re.findall(r"\[@([^=]+)='([^']*)'\]", preds))
+    (tag, preds), rest = steps[0], steps[1:]
+    if root.tag != tag or not matches(root, preds):
+        return []
+    found = [root]
+    for tag, preds in rest:
+        found = [c for el in found for c in el if c.tag == tag and matches(c, preds)]
+    return found
 
 CLIENT_COLOURS = ('color20', 'color21', 'color22', 'color23', 'color20_dark', 'color21_dark', 'color22_dark', 'color23_dark')
 
@@ -304,38 +356,82 @@ def client_problems(client, repo, source_rel):
     return out
 
 
-def secrets_problems(secrets, owns):
-    """The rules of secrets_check in docker/censhare-server/customer-secrets.sh (#450), which publish-customization.sh
-    and the cell apply too (tests/test-customer-secrets.sh compares them): a package names its secrets, each into an XML
-    file inside a path it owns; it never carries a value."""
-    if secrets is None:
+def named_values_problems(field, limit, values, owns):
+    """The rules of named_values_check in docker/censhare-server/customer-secrets.sh, which publish-customization.sh and
+    the cell apply too, for `secrets` (#450) and `parameters` (#942) alike (tests/test-customer-secrets.sh and
+    tests/test-customer-parameters.sh compare them): a package names its values, each into an XML file inside a path it
+    owns; it never carries a value."""
+    if values is None:
         return []
-    if not isinstance(secrets, list):
-        return ['secrets must be a list']
-    if len(secrets) > SECRETS_MAX:
-        return [f'secrets lists {len(secrets)} entries; at most {SECRETS_MAX}']
+    if not isinstance(values, list):
+        return [f'{field} must be a list']
+    if len(values) > limit:
+        return [f'{field} lists {len(values)} entries; at most {limit}']
     out = []
-    for i, e in enumerate(secrets):
+    for i, e in enumerate(values):
         if not isinstance(e, dict):
-            out.append(f'secrets[{i}] is not an object'); continue
-        extra = sorted(set(e) - {'name', 'file', 'attribute'})
-        name, f, attr = e.get('name'), e.get('file'), e.get('attribute')
+            out.append(f'{field}[{i}] is not an object'); continue
+        if 'service' in e:
+            out += service_entry_problems(field, i, e)
+            continue
+        extra = sorted(set(e) - {'name', 'file', 'attribute', 'path'})
+        name, f, attr, path = e.get('name'), e.get('file'), e.get('attribute'), e.get('path')
         if extra:
-            out.append(f'secrets[{i}] has {", ".join(extra)}: only name, file and attribute (a package never carries a value)')
+            out.append(f'{field}[{i}] has {", ".join(extra)}: only name, file and attribute or path (a package never carries a value)')
         elif not isinstance(name, str) or not SECRET_NAME.match(name):
-            out.append(f'secrets[{i}].name must be lower-case a-z, 0-9 and -, at most 63 characters')
+            out.append(f'{field}[{i}].name must be lower-case a-z, 0-9 and -, at most 63 characters')
         elif not isinstance(f, str) or not SECRET_FILE.match(f) or re.search(r'(^|/)\.\.(/|$)|//', f):
-            out.append(f'secrets[{i}].file must be the path of an XML file under app/, without .. or //')
+            out.append(f'{field}[{i}].file must be the path of an XML file under app/, without .. or //')
         elif not any(f.startswith(o + '/') for o in owns if isinstance(o, str)):
-            out.append(f'secrets[{i}].file {f} is not inside a path the package owns')
-        elif not isinstance(attr, str) or not SECRET_ATTR.match(attr):
-            out.append(f'secrets[{i}].attribute must be an XML attribute name')
-    objs = [e for e in secrets if isinstance(e, dict)]
+            out.append(f'{field}[{i}].file {f} is not inside a path the package owns')
+        elif ('attribute' in e) == ('path' in e):
+            out.append(f'{field}[{i}] needs attribute or path, one of them')
+        elif 'attribute' in e and (not isinstance(attr, str) or not SECRET_ATTR.match(attr)):
+            out.append(f'{field}[{i}].attribute must be an XML attribute name')
+        elif 'path' in e and (not isinstance(path, str) or len(path) > 512 or not NAMED_VALUE_PATH.match(path)):
+            out.append(f"{field}[{i}].path must be /<element>/...[@<name>='<literal>']/@<attribute>: names without a prefix, "
+                       'literals of letters, digits, space and . _ : / + -, at most 512 characters')
+    objs = [e for e in values if isinstance(e, dict)]
     names = [e.get('name') for e in objs]
-    out += [f'secrets name {n} appears more than once' for n in sorted({n for n in names if names.count(n) > 1}, key=str)]
-    pairs = [(e.get('file'), e.get('attribute')) for e in objs]
-    out += [f'secrets put two values into {f} config@{a}' for f, a in sorted({p for p in pairs if pairs.count(p) > 1}, key=str)]
+    out += [f'{field} name {n} appears more than once' for n in sorted({n for n in names if names.count(n) > 1}, key=str)]
+    pairs = [(e.get('file'), value_target(e)) for e in objs]
+    out += [f'{field} put two values into {f + " " if f else ""}{t}' for f, t in sorted({p for p in pairs if pairs.count(p) > 1}, key=str)]
     return out
+
+
+def service_entry_problems(field, i, e):
+    """A value or secret for a service's configuration (#1094): name, service and a path on the edition's list."""
+    extra = sorted(set(e) - {'name', 'service', 'path'})
+    name, svc, path = e.get('name'), e.get('service'), e.get('path')
+    if extra:
+        return [f'{field}[{i}] has {", ".join(extra)}: a service entry is only name, service and path']
+    if not isinstance(name, str) or not SECRET_NAME.match(name):
+        return [f'{field}[{i}].name must be lower-case a-z, 0-9 and -, at most 63 characters']
+    if not isinstance(svc, str) or not SERVICE_NAME.match(svc):
+        return [f'{field}[{i}].service must be a service name']
+    if not isinstance(path, str) or not NAMED_VALUE_PATH.match(path):
+        return [f'{field}[{i}] names a service: it needs a path of the checked form']
+    listed = service_values()
+    kind = 'secret' if field == 'secrets' else 'value'
+    if listed is not None and f'{svc} {kind} {path}' not in listed:
+        return [f"{field}[{i}]: {svc} {path} is not on the edition's list of service paths for {field} (CUSTOMER_SERVICE_VALUES)"]
+    return []
+
+
+def secrets_problems(secrets, owns):
+    """secrets_check in docker/censhare-server/customer-secrets.sh (#450)."""
+    return named_values_problems('secrets', SECRETS_MAX, secrets, owns)
+
+
+def parameters_problems(parameters, owns, secrets=None):
+    """parameters_check in docker/censhare-server/customer-parameters.sh (#942, decision 0025): the rules of secrets,
+    and no value into an attribute a secret of the package already fills."""
+    out = named_values_problems('parameters', PARAMETERS_MAX, parameters, owns)
+    if out or not parameters or not isinstance(secrets, list):
+        return out
+    taken = {(e.get('file'), value_target(e)) for e in secrets if isinstance(e, dict)}
+    return [f'parameters and secrets put two values into {e["file"] + " " if e.get("file") else ""}{value_target(e)}'
+            for e in parameters if (e.get('file'), value_target(e)) in taken]
 
 def credential_hits(data):
     """What in a file's bytes looks like a credential: 'a private key', 'an AWS access key id', 'a password-like value'
@@ -450,26 +546,52 @@ def main(argv):
         elif spec.get('touchesMasterdata') is True and not has_md:
             r.warn('"touchesMasterdata" is true, but the package carries no masterdata')
 
-        # Secrets (#450): the rules, then what only the package itself can show: each named file is delivered (excludes
-        # applied) and has a <config> under its root, where the cell sets the attribute at boot.
+        # Secrets (#450) and environment values (#942): the rules, then what only the package itself can show: each named
+        # file is delivered (excludes applied) and has a <config> under its root, where the cell sets the attribute at boot;
+        # a parameter's attribute is not set there already.
         problems = secrets_problems(spec.get('secrets'), owns)
         for m in problems:
             r.error(m)
+        params_problems = parameters_problems(spec.get('parameters'), owns, spec.get('secrets'))
+        for m in params_problems:
+            r.error(m)
         for m in client_problems(spec.get('client'), repo, spec.get('source')):
             r.error(m)
-        if not problems and spec.get('secrets'):
+        named = ([('secret', e) for e in spec['secrets'] if 'file' in e] if not problems and spec.get('secrets') else []) \
+            + ([('parameter', e) for e in spec['parameters'] if 'file' in e] if not params_problems and spec.get('parameters') else [])
+        # Lists only: anything else is reported above (secrets must be a list), never a crash here (#1118 review).
+        entries = [e for k in ('secrets', 'parameters') if isinstance(spec.get(k), list) for e in spec[k] if isinstance(e, dict)]
+        if service_values() is None and any('service' in e for e in entries):
+            r.warn('a value or secret names a service: its path is checked against the edition\'s list by the cell, not here')
+        if named:
             delivered = {rel for _, rel in files}
-            for e in spec['secrets']:
+            for kind, e in named:
                 if e['file'] not in delivered:
-                    r.error(f'secret {e["name"]}: {e["file"]} is not a file the package delivers')
+                    r.error(f'{kind} {e["name"]}: {e["file"]} is not a file the package delivers')
                     continue
                 try:
                     root = ET.parse(os.path.join(source, e['file'])).getroot()
                 except Exception as x:
-                    r.error(f'secret {e["name"]}: {e["file"]} is not well-formed XML ({x})'); continue
-                if root.find('config') is None:
-                    r.error(f'secret {e["name"]}: {e["file"]} has no <config> under its root <{root.tag}>, where the '
-                            'cell sets the attribute')
+                    r.error(f'{kind} {e["name"]}: {e["file"]} is not well-formed XML ({x})'); continue
+                if 'path' in e:
+                    found = path_elements(root, e['path'])
+                    attr = e['path'].rsplit('/@', 1)[1]
+                    if len(found) != 1:
+                        r.error(f'{kind} {e["name"]}: {e["path"]} matches {len(found)} elements of {e["file"]}, not '
+                                'one, where the cell sets the attribute')
+                        continue
+                    element = found[0]
+                else:
+                    element, attr = root.find('config'), e['attribute']
+                    if element is None:
+                        r.error(f'{kind} {e["name"]}: {e["file"]} has no <config> under its root <{root.tag}>, where the '
+                                'cell sets the attribute')
+                        continue
+                if kind == 'parameter' and element.get(attr) is not None:
+                    # The cell sets it at boot, and removes it when the value cannot be read: a default kept there would
+                    # be replaced, then vanish (#1084 review). No value, no attribute.
+                    r.error(f'parameter {e["name"]}: {e["file"]} already sets {value_target(e)}; the cell sets it '
+                            'from the value at boot and removes it when there is none, so leave it out of the file')
 
         vendor = spec.get('vendor') if isinstance(spec.get('vendor'), str) else ''
         foreign, variants = {}, {}

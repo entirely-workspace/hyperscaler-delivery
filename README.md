@@ -56,6 +56,21 @@ CLI (python3 for the check before anything is stored).
 Only committed files are delivered, and only the tip of the branch: a re-run or a late run of an older push ends green
 and delivers nothing, since a newer push is on its way.
 
+A value that differs between dev, test and prod (an SAP URL, a host) is never in your files: name it, and the customer
+sets it on each cell. Leave the attribute out of the file; the cell fills it in. A password or token is a secret
+(`secrets`, the same shape), never a value.
+```json
+"parameters": [ { "name": "sap-url", "file": "app/modules/acme/sap/aa-acme-sap.xml", "attribute": "sap-url" } ]
+```
+`attribute` sets an attribute of the first `<config>` in that file (an XSL reads `$config/config/@sap-url`); `path`
+instead, such as `"/mail/account/property[@key='mail.smtp.host']/@value"`, sets another element's. A version naming
+a value the cell does not have yet is refused, and the cell keeps what it runs: ask the customer to set it first.
+For a censhare service's configuration, such as the mail service's SMTP host, name `"service": "mail"` and a `path`
+instead of a file: only paths on the edition's list are taken (docs/CUSTOMIZATION-DELIVERY.md).
+
+Before a package reaches a cell, the delivery checks that the cell can apply what it uses: a package naming
+environment values (`parameters`) is refused for a cell whose edition cannot set them, and the run says why.
+
 ## GitLab CI
 GitLab vouches for the job with its OIDC token, which becomes the publisher role; no key is stored. The customer
 delegates your project's path and branch (or tag) the same way. Include the kit's template and extend its job:

@@ -49,6 +49,8 @@ while [ $# -gt 0 ]; do
     *) usage >&2; fail "unknown argument '$1'" ;;
   esac
 done
+# publish.sh reads these too: a value given only as a flag must reach it (#684).
+export CUSTOMER PACKAGES_BUCKET ACTIVATE REASON
 if [ -n "$ROLE" ]; then
   [[ "$ROLE" =~ ^arn:aws[a-z-]*:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+$ ]] || fail "--publisher-role must be a role ARN"
   [ -n "${AWS_WEB_IDENTITY_TOKEN_FILE:-}" ] && [ -s "$AWS_WEB_IDENTITY_TOKEN_FILE" ] \

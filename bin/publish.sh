@@ -3,9 +3,9 @@
 # and store it in a customer's package store (#780). The one script for every path: a delegated partner pipeline runs
 # its own copy, next to deliver.sh in its repository (docs/RUNBOOK.md, #779 and #826), and a customer's activations
 # (lib/customer-customization-stack.ts) run it to place a stored package into a cell. The hyperscaler-partner-publish
-# GitHub action keeps an older copy that publishes straight to a cell (#346) and never stores. Everything a cell runs is
-# checked and signed by the cell itself (its intake): this script only delivers the package and reports the cell's
-# answer.
+# GitHub action carries the kit's copy, byte for byte (its CI fails when a kit release changes it, #1110), and publishes
+# straight to a cell (#346) without storing. Everything a cell runs is checked and signed by the cell itself (its
+# intake): this script only delivers the package and reports the cell's answer.
 #
 #   publish.sh check    the checks that need no access to the cell (run before the job gets the cell's credentials)
 #   publish.sh run      upload, send the request, wait for the result
@@ -166,8 +166,91 @@ from_store() {
 }
 [ -n "${FROM_STORE:-}" ] && [ "$MODE" = run ] && from_store
 
+# cell_reachable: an activation signs in to its stage's cell as the cell's publish role before anything is sent. A cell
+# whose environment file has no `delivery` entry for this vendor has no such role (the #684 run: AccessDenied on every
+# file); say so, and what fixes it, instead.
+cell_reachable() {
+  [ -n "${FROM_STORE:-}" ] && [ -n "${CELL_PROFILE:-}" ] || return 0
+  local err
+  err=$(aws --profile "$CELL_PROFILE" sts get-caller-identity 2>&1 >/dev/null) && return 0
+  case "$err" in
+    *AccessDenied*|*NoSuchEntity*|*"not authorized"*)
+      fail "the cell ${CELL:-of stage ${STAGE:-?}} does not let this activation in as ${CELL_ROLE:-its publish role}: it is not set up to take ${STORE_VENDOR}'s packages from the store. In the cell's environment file, add the partner entry {\"vendor\": \"${STORE_VENDOR}\", \"delivery\": {\"customer\": ..., \"stage\": \"${STAGE:-?}\", \"account\": ...}} and deploy the cell (docs/RUNBOOK.md, \"A customer's package store\", step 4)" ;;
+    *) fail "the cell ${CELL:-of stage ${STAGE:-?}} could not be reached as ${CELL_ROLE:-its publish role}: $(printf '%s' "$err" | tr '\n' ' ' | cut -c1-300)" ;;
+  esac
+}
+[ "$MODE" = run ] && cell_reachable
+
+# The fields whose meaning depends on the cell (#1095): a cell's intake from an older edition does not know them and
+# would activate the package without them, silently (`parameters`, #942: the values would never be set). The next such
+# field joins this list and lib/manifest-fields.ts. Kept here, so every copy of this script (a partner's kit) has it.
+CELL_FIELDS='parameters'
+# cell_fields_check: before anything is sent, a package that uses one of CELL_FIELDS goes only to a cell whose edition
+# applies it: the list the tenant stack publishes, /censhare/customizations/<BUCKET>/manifest-fields (SSM), read with
+# the cell's publish role. A cell without it, or a role that may not read it, is from an edition before #1095 (AWS's
+# own error and the region are said, so a permission boundary or a runner in the wrong region is not mistaken for it).
+# A rollback (VERSION) checks the version it restores, not the tip: its customization.json from this checkout, else the
+# commit fetched (a depth-1 checkout lacks it), else the cell's own copy of what was sent (incoming/, kept 30 days). One
+# that cannot be read at all is checked as if it named every one of CELL_FIELDS: it fails closed, but only on a cell
+# that cannot apply them (review of #1111).
+version_spec() {
+  local prefix
+  prefix=$(git rev-parse --show-prefix 2>/dev/null)
+  git show "$VERSION:${prefix}customization.json" 2>/dev/null && return 0
+  if git rev-parse --git-dir >/dev/null 2>&1 \
+     && GIT_TERMINAL_PROMPT=0 git fetch -q --depth=1 origin "$VERSION" >/dev/null 2>&1; then
+    git show "$VERSION:${prefix}customization.json" 2>/dev/null && return 0
+  fi
+  aws ${CELL_PROFILE:+--profile "$CELL_PROFILE"} s3api get-object --bucket "$BUCKET" \
+    --key "incoming/$VENDOR/$PACKAGE/$VERSION/customization.json" "$TMP/version-spec.json" >/dev/null 2>&1 \
+    && cat "$TMP/version-spec.json"
+}
+cell_fields_check() {
+  local spec used f need="" listed="" err="" raw try region cell="${CELL:-$BUCKET}" unread=""
+  if [ -z "$VERSION" ]; then
+    spec=$(cat customization.json)
+  elif ! spec=$(version_spec); then
+    unread=" and $VERSION's customization.json could not be read (not in this checkout, not fetched, no longer in the cell's intake), so it may name it"
+    echo "$VERSION's customization.json could not be read: the cell is checked for every field that depends on it ($CELL_FIELDS)"
+  fi
+  if [ -n "$unread" ]; then
+    need=$CELL_FIELDS
+  else
+    # A file jq cannot read is not a package without values (review of #1111).
+    used=$(jq -r '[to_entries[] | select(.value != null and .value != [] and .value != {} and .value != "") | .key] | .[]' <<< "$spec" 2>/dev/null) \
+      || fail "the customization.json of ${VERSION:-this commit} is not a JSON object, so the cell's fields cannot be checked; nothing was sent"
+    for f in $CELL_FIELDS; do grep -qx -- "$f" <<< "$used" && need="$need $f"; done
+  fi
+  [ -n "$need" ] || return 0
+  # Only a cell profile names the cell's region. Without one (the GitHub action: the job's credentials are the cell's
+  # role), the job's AWS_REGION is the cell's, and the machine's default profile must not outrank it (review of #1110).
+  region=
+  [ -n "${CELL_PROFILE:-}" ] && region=$(aws --profile "$CELL_PROFILE" configure get region 2>/dev/null || true)
+  for try in 1 2 3; do
+    # In the cell profile's region: a store activation's AWS_REGION is the delivery account's, and outranks the profile;
+    # S3 follows a region redirect, SSM does not (review of #1095).
+    listed=$(aws ${CELL_PROFILE:+--profile "$CELL_PROFILE"} ${region:+--region "$region"} ssm get-parameter --name "/censhare/customizations/$BUCKET/manifest-fields" \
+               --query Parameter.Value --output text 2> "$TMP/fields.err") && break
+    raw=$(tr -s '\n' ' ' < "$TMP/fields.err" | cut -c1-300)
+    case "$raw" in
+      *ParameterNotFound*) listed=NONE; err="no list of fields in ${region:-this region}: an edition from before #1095, or the cell is in another region (run in the cell's region)"; break ;;
+      *AccessDenied*|*"not authorized"*) listed=NONE; err="its list of fields could not be read: an edition from before #1095, or a permission in the way: $raw"; break ;;
+      # Only what may pass on another try is retried (review of #1111): throttling, AWS's own errors, the network.
+      *Throttl*|*TooManyRequests*|*RequestLimitExceeded*|*InternalServerError*|*ServiceUnavailable*|*"Could not connect"*|*"timed out"*|*"Connection was closed"*) ;;
+      *) fail "could not read ${cell}'s list of fields (which fields its edition applies): $raw; nothing was sent" ;;
+    esac
+    [ "$try" = 3 ] && fail "could not read ${cell}'s list of fields (which fields its edition applies): $raw; nothing was sent, try again"
+    sleep "$try"
+  done
+  for f in $need; do
+    if [ "$listed" = NONE ] || ! jq -e --arg f "$f" 'type == "array" and any(.[]; . == $f)' <<< "$listed" >/dev/null 2>&1; then
+      fail "refusing: ${cell}'s cell runs an edition that cannot apply $f${err:+ ($err)}${unread}; release #1095's edition (or a later one) to it first (nothing was sent)"
+    fi
+  done
+}
+
 # test_gate: into test only a stored digest dev accepted, for the commit its manifest names (decision 0023). Whoever
-# started the run: the Control Center or a delegated pipeline promoting a stored version. Read before anything is sent.
+# started the run: the Solution Console or a delegated pipeline promoting a stored version. Read before anything is sent.
 # A customer without a dev stage has no dev to accept anything: the buildspec says so (DEV_STAGE=no, out of an
 # override's reach), and only that exact value skips the check.
 test_gate() {
@@ -263,6 +346,8 @@ case "$MODE" in run|store) ;; *) fail "usage: publish.sh check|run|store" ;; esa
 
 BASE="incoming/$VENDOR/$PACKAGE/$ID"
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+# Still before anything is sent (#1095).
+[ "$MODE" = run ] && cell_fields_check
 
 # upload: the <key>\0<file>\0 pairs on stdin, $PARALLEL at a time, each only if the key is not there yet (If-None-Match:
 # *; see __put above). Returns once every upload has ended, and fails if any did. The action's upload.py does it in one

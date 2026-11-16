@@ -74,10 +74,14 @@ Until then, mirror the repository to gitlab.com or GitHub, or use CodeCommit.
 | Stage | Who moves a package there | What it takes |
 |---|---|---|
 | dev | your pipeline, on a push to `main` | a package that passes the check |
-| test | your pipeline on `test`, if test is delegated to you; otherwise the customer's developer, in the Control Center | **a package dev already accepted**, for the same commit, if the customer has a dev stage: deliver to dev first, then push the same commit to `test`. Without a dev stage, test takes the package as it is. |
-| prod | the customer's release owner, in the Control Center | a package test accepted, which the release owner approves and then puts live |
+| test | your pipeline on `test`, if test is delegated to you; otherwise the customer's developer, in the Solution Console | **a package dev already accepted**, for the same commit, if the customer has a dev stage: deliver to dev first, then push the same commit to `test`. Without a dev stage, test takes the package as it is. |
+| prod | the customer's release owner, in the Solution Console | a package test accepted, which the release owner approves and then puts live |
 
 A promotion moves the same digest. What goes live in prod is byte for byte what test accepted.
+
+What differs per stage is not in the package: a value it names (`parameters`, such as the SAP URL) is set on each
+stage's cell by the customer, in the Solution Console's Environment values tab, before the version is promoted there.
+A stage that lacks one refuses the version and keeps the one it runs.
 
 ## Hotfix
 A hotfix takes the same path: dev, then test, then the customer's approval for prod. Only the speed differs, with
@@ -87,9 +91,9 @@ revert it on `main` first.
 
 ## Rolling back
 - **dev:** revert the change on the delegated branch and push. That delivers the reverted tip.
-- **test:** the customer's developer promotes an earlier package, by its digest, in the Control Center. Like any
+- **test:** the customer's developer promotes an earlier package, by its digest, in the Solution Console. Like any
   promotion to test, it must be one dev accepted (if the customer has a dev stage).
-- **prod:** the customer's release owner rolls back to an earlier release in the Control Center. Prod keeps every
+- **prod:** the customer's release owner rolls back to an earlier release in the Solution Console. Prod keeps every
   release it ran, and what each one replaced. A rollback is a promotion like any other: the earlier package must be
   one test accepted and the customer approved, or it is refused
   (`test has not accepted`, `the customer has not approved`).
@@ -114,5 +118,5 @@ again, the customer asks censhare for a new delegation.
 ## For customers: where the source should live
 Keep your customization's source in a repository **you** own, and give your partner access to it. Changing partners
 then means changing who has access, not moving the code. The delegation names the repository and branch, so you
-decide which ones may deliver. You can revoke one at any time: in the Control Center once your cells run it, or by
+decide which ones may deliver. You can revoke one at any time: in the Solution Console once your cells run it, or by
 asking censhare.
