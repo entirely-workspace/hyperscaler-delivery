@@ -33,7 +33,8 @@ Until then, mirror the repository to gitlab.com or GitHub, or use CodeCommit.
 ## Getting started
 1. **Agree on the package with the customer.** It needs:
    - your vendor id: lower-case letters, digits, `-` and `_`, starting with a letter or digit, for example `acme`
-     (`censhare`, `hyperscaler` and `incoming` are taken). censhare checks these when it sets up the delegation;
+     (`censhare`, `hyperscaler`, `incoming`, `incoming-workflows` and `workflows-deployer` are taken). censhare checks
+     these when it sets up the delegation;
      `bin/validate.sh` checks only the characters;
    - a package name;
    - the folders it owns under `censhare-Custom/censhare-Server/`, for example `app/modules/acme`.
@@ -63,9 +64,15 @@ Until then, mirror the repository to gitlab.com or GitHub, or use CodeCommit.
 
   The job fails when the cell refuses the package, and it prints the cell's reason.
 - **Check before you push**, on your own machine, with `bin/validate.sh .`. It needs no AWS and no network.
+- **Workflows** from an automations repository (`workflows/workflows.json` with your vendor and package) go the same
+  way, checked against the cell's deploy rules, stored, and activated in the stage's cell, which builds and deploys
+  them; they go live at once, with no restart. A rollback is delivering the earlier commit again. The customer must
+  allow workflows for your repository (`"types"` in its delegation, or for all of the customer's delegations); without it, the package is stored but the activation is
+  refused (`AccessDenied` on `StartBuild`).
 - **When it takes effect.** By default, the cell takes the package at its next restart (`next-boot`). `now` restarts
   the customer's server straight away, so it needs a reason, which is kept in the cell's record. Warn the people
-  working on that cell before you use it, also on dev and test.
+  working on that cell before you use it, also on dev and test. Workflows go live as soon as the cell has deployed
+  them, with no restart: `activate` does not apply to them. They are delivered to dev and test; prod comes later.
 - **Only the tip of the branch is delivered.** A re-run of an older push, or a run that a newer push overtook, ends
   green and delivers nothing. The newer push is on its way.
 - **The result** shows in your pipeline. The customer's chosen contacts also get an email for each activation.
@@ -109,6 +116,7 @@ revert it on `main` first.
 | `dev has not accepted` | A promotion to test of a package dev never accepted | Deliver that commit to dev first |
 | The cell refused the package, with a reason | The cell's own checks refused it: a collision with another package, a missing setting or a missing asset | Fix it and push again. Ask the customer if it's their setting. |
 | Green, but "superseded" | A newer push is delivering | Nothing to do |
+| `set PACKAGE_TYPE to censhare-custom or workflows` | The repository has both `customization.json` and `workflows/workflows.json` | Set `PACKAGE_TYPE` to the one this pipeline delivers |
 
 ## If the customer revokes your delegation
 No activation of yours starts again, and no package you stored reaches a cell, whoever promotes it. Your pipeline may

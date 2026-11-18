@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "masterdata.changed",
+  "description": "A master-data table changed (censhare CacheManager/refresh, the all-locales copy). About a table, not an asset; never the records themselves. Source censhare.server (docs/EVENTS.md).",
+  "type": "object",
+  "required": [
+    "version",
+    "table"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "version": {
+      "const": 1,
+      "description": "The detail's schema version. Raised only for a change a subscriber could break on; a new member is not one."
+    },
+    "schema": {
+      "type": "string",
+      "description": "censhare database schema, e.g. corpus."
+    },
+    "table": {
+      "type": "string",
+      "description": "The master-data table, e.g. party, role, domain."
+    },
+    "added": {
+      "type": "integer",
+      "description": "Records added, when censhare still had the refresh's list of changes."
+    },
+    "modified": {
+      "type": "integer",
+      "description": "Records changed, likewise."
+    },
+    "removed": {
+      "type": "integer",
+      "description": "Records removed, likewise."
+    },
+    "ids": {
+      "type": "array",
+      "items": {
+        "type": "integer"
+      },
+      "maxItems": 100,
+      "description": "Numeric ids of the records, at most 100; absent when unknown."
+    },
+    "correlationId": {
+      "type": "string",
+      "pattern": "^1-[0-9a-f]{8}-[0-9a-f]{24}$",
+      "description": "The X-Ray trace id the server gave the event when it published it (#1088). EventBridge passes it on to the run the event starts, and the server log line for the event names it too."
+    }
+  }
+}

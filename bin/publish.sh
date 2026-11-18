@@ -16,7 +16,9 @@
 #   <vendor>/packages/<hex>/stored-by/<role>.json         who stored it, written once before the manifest; a publisher
 #                                                         role may write only its own name (decision 0023)
 #   <vendor>/packages/<hex>/<stage>-result.json           the stage cell's last answer for it (test's is acceptance)
-#   <vendor>/versions/<package>/<commit>.json             the commit's digest
+#   <vendor>/versions/<package>/<commit>.json             a customization commit's digest and its package's type (#762)
+#   <vendor>/versions/_workflows/<package>/<commit>.json  a workflows commit's (#1101 review): apart, so the Control
+#                                                         Center's version list never reads them (no package starts with _)
 #   <vendor>/packages/<hex>/prod-approval.json            the customer's approval for prod (#781), written once
 #   <vendor>/prod/<package>/current.json, history/...     prod's release: what runs, and every promotion
 # A run with FROM_STORE=<digest> (and STORE_VENDOR) publishes a stored package instead of a checkout: from an empty
@@ -36,6 +38,12 @@
 #   WAIT_MINUTES    how long to wait for the cell's answer (default 10)
 #   PACKAGES_BUCKET the customer's package store (the caller's own credentials, never CELL_PROFILE)
 #   FROM_STORE      sha256:<hex>, the stored package to publish (run); STORE_VENDOR its vendor
+#   PACKAGE_TYPE    censhare-custom or workflows (#762); needed when the folder has both customization.json and
+#                   workflows/workflows.json. A workflows package is checked and stored (store, check); its manifest in
+#                   the store says "type": "workflows" (a manifest without "type" is censhare-custom's). It reaches a cell
+#                   only from the store (#1071): run with FROM_STORE, with PACKAGE_TYPE=workflows (the workflows
+#                   activation sets it), into the cell's incoming-workflows/ for its workflows deployer, every activation
+#                   with the whole package. An activation of one type refuses a stored package of the other
 #   STAGE           the stage this run publishes for; names the answer kept in the store
 #   OUTCOME_FILE    where to write what happened, as JSON, for whoever reports the result (#646, #781): status
 #                   (published, activated, refused, superseded, failed, timeout), version, package, files, digest,
@@ -148,6 +156,12 @@ from_store() {
   aws s3api get-object --bucket "$PACKAGES_BUCKET" --key "$at/manifest.json" "$m" >/dev/null 2>&1 \
     || fail "$FROM_STORE is not in the store for $STORE_VENDOR"
   [ "$(jq -r .digest "$m")" = "$FROM_STORE" ] || fail "the manifest at $at names another digest"
+  # A manifest without a type is a customization's, stored before types (#762). Each type has its own activation (#1071):
+  # the customization's (PACKAGE_TYPE=censhare-custom, or none from before #1104) takes customizations only, the
+  # workflows activation (PACKAGE_TYPE=workflows) workflows packages only. Each project writes its type into its command.
+  local stored_type; stored_type=$(jq -r '.type // "censhare-custom"' "$m")
+  [ "$stored_type" = "${PACKAGE_TYPE:-censhare-custom}" ] \
+    || fail "$FROM_STORE is a $stored_type package, and this activation takes ${PACKAGE_TYPE:-censhare-custom} packages: activate it with its own type's activation"
   STORE_COMMIT=$(jq -r '.commit // empty' "$m")
   [[ "$STORE_COMMIT" =~ $COMMIT_RE ]] || fail "the stored manifest has no full commit"
   while IFS=$'\t' read -r sum path; do
@@ -280,15 +294,37 @@ prod_gate() {
 }
 
 # ---- the package and the request, checked before anything is sent
-[ -f customization.json ] || fail "no customization.json here ($(pwd)); set working-directory to the folder that has it"
-jq -e 'type == "object"' customization.json >/dev/null 2>&1 || fail "customization.json is not a JSON object"
-VENDOR=$(jq -r '.vendor // empty' customization.json)
-PACKAGE=$(jq -r '.package // empty' customization.json)
-SOURCE=$(jq -r '.source // empty' customization.json)
-[[ "$VENDOR" =~ $NAME_RE ]] || fail "customization.json: \"vendor\" must be lower-case [a-z0-9_-], not '$VENDOR'"
-[[ "$PACKAGE" =~ $NAME_RE ]] || fail "customization.json: \"package\" must be lower-case [a-z0-9_-], not '$PACKAGE'"
+# Its type (#762): which file the folder has. customization.json is a customization (censhare-custom), the package this
+# script publishes to a cell; workflows/workflows.json is an automations repository's workflows, which are stored
+# only, until the workflows activator (#1071) places them. A folder with both says which with PACKAGE_TYPE.
+case "${PACKAGE_TYPE:-}" in
+  "") if [ -f customization.json ] && [ -f workflows/workflows.json ]; then
+        fail "this folder has both customization.json and workflows/workflows.json: set PACKAGE_TYPE to censhare-custom or workflows"
+      elif [ -f workflows/workflows.json ]; then TYPE=workflows
+      else TYPE=censhare-custom; fi ;;
+  censhare-custom|workflows) TYPE=$PACKAGE_TYPE ;;
+  *) fail "PACKAGE_TYPE must be censhare-custom or workflows, not '$PACKAGE_TYPE'" ;;
+esac
+case "$TYPE" in
+  censhare-custom) MANIFEST=customization.json ;;
+  workflows) MANIFEST=workflows/workflows.json ;;
+esac
+[ -f "$MANIFEST" ] || fail "no $MANIFEST here ($(pwd)); set working-directory to the folder that has it"
+jq -e 'type == "object"' "$MANIFEST" >/dev/null 2>&1 || fail "$MANIFEST is not a JSON object"
+VENDOR=$(jq -r '.vendor // empty' "$MANIFEST")
+PACKAGE=$(jq -r '.package // empty' "$MANIFEST")
+# A workflows package is the workflows/ folder; a customization names its folder.
+if [ "$TYPE" = workflows ]; then SOURCE=workflows; else SOURCE=$(jq -r '.source // empty' "$MANIFEST"); fi
+[[ "$VENDOR" =~ $NAME_RE ]] || fail "$MANIFEST: \"vendor\" must be lower-case [a-z0-9_-], not '$VENDOR'"
+[[ "$PACKAGE" =~ $NAME_RE ]] || fail "$MANIFEST: \"package\" must be lower-case [a-z0-9_-], not '$PACKAGE'"
+# A workflows package reaches a cell only from the store, by digest (#1071): never from a checkout, and never by a version
+# the cell holds (the cell keeps no workflows versions; a rollback is activating the earlier digest).
+if [ "$TYPE" = workflows ] && { { [ "$MODE" = run ] && [ -z "${FROM_STORE:-}" ]; } || [ -n "$VERSION" ]; }; then
+  fail "a workflows package reaches a cell only from the store: deliver it (deliver.sh), or activate a stored digest (FROM_STORE)"
+fi
 case "$ACTIVATE" in next-boot|now) ;; *) fail "activate must be next-boot or now, not '$ACTIVATE'" ;; esac
-if [ "$ACTIVATE" = now ] && [ -z "${REASON//[[:space:]]/}" ]; then
+# Workflows go live when the cell deploys them, without a restart: activate and its reason do not apply (the notice below).
+if [ "$ACTIVATE" = now ] && [ "$TYPE" != workflows ] && [ -z "${REASON//[[:space:]]/}" ]; then
   fail "activate: now restarts the customer's server: give a reason"
 fi
 [[ "$WAIT_MINUTES" =~ ^[0-9]{1,3}$ ]] || fail "wait-minutes must be a number of minutes, not '$WAIT_MINUTES'"
@@ -309,9 +345,17 @@ elif [ -n "${FROM_STORE:-}" ] && [ "$MODE" = run ]; then
   # Checked when it was stored and again just now; the cell knows a version by its commit.
   [ "$VENDOR" = "$STORE_VENDOR" ] || fail "the stored package is $VENDOR's, not $STORE_VENDOR's"
   ID=$STORE_COMMIT DIGEST=$FROM_STORE
-  REQUEST=$(jq -nc --arg a "$ACTIVATE" --arg r "$REASON" \
-    '{action: "publish", activate: $a} + (if $r == "" then {} else {reason: $r} end)')
-  WHAT="publish $VENDOR/$PACKAGE $DIGEST @ $ID from the store (${#FILES[@]} files)"
+  if [ "$TYPE" = workflows ]; then
+    # The cell's workflows deployer builds the workflows stack from the files and deploys it; it answers with the commit
+    # as the version, as the intake does. It goes live on deploy: no next boot, so no activate or reason.
+    REQUEST=$(jq -nc --arg c "$ID" --arg d "$DIGEST" '{action: "deploy", type: "workflows", commit: $c, digest: $d}')
+    [ "$ACTIVATE" = now ] && echo "${N}activate: now does not apply to workflows: they go live when the cell deploys them, without a restart"
+    WHAT="deploy the workflows of $VENDOR/$PACKAGE $DIGEST @ $ID from the store (${#FILES[@]} files)"
+  else
+    REQUEST=$(jq -nc --arg a "$ACTIVATE" --arg r "$REASON" \
+      '{action: "publish", activate: $a} + (if $r == "" then {} else {reason: $r} end)')
+    WHAT="publish $VENDOR/$PACKAGE $DIGEST @ $ID from the store (${#FILES[@]} files)"
+  fi
   [ "${STAGE:-}" = test ] && test_gate
   [ "${STAGE:-}" = prod ] && prod_gate
 else
@@ -327,10 +371,10 @@ else
   # any file name arrives as it is.
   FILES=()
   # Sorted bytewise, not by the locale's collation: the digest below must be the same on every machine (#750 review).
-  while IFS= read -r -d '' f; do FILES+=("$f"); done < <(git ls-files -z -- customization.json "$SOURCE" | LC_ALL=C sort -z)
+  while IFS= read -r -d '' f; do FILES+=("$f"); done < <(git ls-files -z -- "$MANIFEST" "$SOURCE" | LC_ALL=C sort -z)
   [ "${#FILES[@]}" -gt 1 ] || fail "the source folder '$SOURCE' has no committed files"
   # A committed symlink would upload whatever it points to on the runner, inside the repository or not.
-  links=$(git ls-files -s -- customization.json "$SOURCE" | awk '$1 == "120000" {sub(/^[^\t]*\t/, ""); print}')
+  links=$(git ls-files -s -- "$MANIFEST" "$SOURCE" | awk '$1 == "120000" {sub(/^[^\t]*\t/, ""); print}')
   [ -z "$links" ] || fail "the package has symlinks, which are not published: $(echo "$links" | tr '\n' ' ')"
   # The package digest: the SHA-256 of "<sha256>  <path>" per file, sorted by path. What the commit's package is,
   # whatever the order of upload; the release build stores the package under it (#645, slice 2).
@@ -345,6 +389,9 @@ case "$MODE" in run|store) ;; *) fail "usage: publish.sh check|run|store" ;; esa
 [ "$MODE" = store ] || [ -n "${BUCKET:-}" ] || fail "bucket is required"
 
 BASE="incoming/$VENDOR/$PACKAGE/$ID"
+# A workflows package (#1071): its own intake, and a folder of its own per activation, with every file. The cell keeps no
+# workflows versions to activate again, and incoming files expire: each activation, a rollback too, brings the package.
+[ "$TYPE" = workflows ] && BASE="incoming-workflows/$VENDOR/$PACKAGE/$ID-$RUN"
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 # Still before anything is sent (#1095).
 [ "$MODE" = run ] && cell_fields_check
@@ -370,10 +417,11 @@ store_package() {
   local at="$VENDOR/packages/${DIGEST#sha256:}"
   for f in "${FILES[@]}"; do printf '%s\0%s\0' "$at/files/$f" "$f"; done | ( BUCKET=$PACKAGES_BUCKET CELL_PROFILE= upload ) \
     || fail "the package could not be stored"
-  sha256 "${FILES[@]}" | jq -R -s --arg c "$ID" --arg d "$DIGEST" --arg v "$VENDOR" --arg p "$PACKAGE" \
-    '{vendor: $v, package: $p, commit: $c, digest: $d,
+  sha256 "${FILES[@]}" | jq -R -s --arg c "$ID" --arg d "$DIGEST" --arg v "$VENDOR" --arg p "$PACKAGE" --arg t "$TYPE" \
+    '{vendor: $v, package: $p, type: $t, commit: $c, digest: $d,
       files: [split("\n")[] | select(length > 0) | capture("^(?<sha256>[0-9a-f]{64})  (?<path>.*)$")]}' > "$TMP/manifest.json"
-  jq -n --arg d "$DIGEST" '{digest: $d}' > "$TMP/version.json"
+  # The type in the pointer too: the customer API lists a vendor's customization versions from the pointers alone (#762).
+  jq -n --arg d "$DIGEST" --arg t "$TYPE" '{digest: $d, type: $t}' > "$TMP/version.json"
   # Who stored it, before the manifest: a revoked delegation's packages reach no cell (decision 0023). The role this runs
   # as; the store lets a publisher role write only its own name, and only records dated no later than the manifest count.
   # Not recorded (not a role, or a store that does not allow it yet): the package's publisher is unknown, which is refused
@@ -390,7 +438,11 @@ store_package() {
   fi
   BUCKET=$PACKAGES_BUCKET CELL_PROFILE= bash "$0" __put "$at/manifest.json" "$TMP/manifest.json" \
     || fail "the package's manifest could not be stored"
-  printf '%s\0%s\0' "$VENDOR/versions/$PACKAGE/$ID.json" "$TMP/version.json" \
+  # A workflows package's pointer apart from the customizations' (#1101 review): the Control Center lists those, newest
+  # first, and a busy automations repository would otherwise make it read through every workflows push.
+  local pointer="$VENDOR/versions/$PACKAGE/$ID.json"
+  [ "$TYPE" = workflows ] && pointer="$VENDOR/versions/_workflows/$PACKAGE/$ID.json"
+  printf '%s\0%s\0' "$pointer" "$TMP/version.json" \
     | ( BUCKET=$PACKAGES_BUCKET CELL_PROFILE= upload ) || fail "the commit's pointer could not be stored"
   echo "stored $VENDOR/$PACKAGE @ $ID as $DIGEST (${#FILES[@]} files)"
   outcome stored
@@ -455,7 +507,13 @@ send() {
   done
 }
 
-if [ -z "$VERSION" ] && answer; then
+# A workflows request goes into a folder of its own run (incoming-workflows/…/<commit>-<run>). One with an answer already
+# is an earlier build's: CodeBuild numbers start again at 1 when the project is made again, and the folders live 30 days.
+# That answer is not this run's, and the customization's "published before" path below is not for workflows (#1104 review).
+if [ "$TYPE" = workflows ] && answer; then
+  rm -f "$TMP/result.json"
+  fail "$BASE already has an answer, from an earlier build with the same number; nothing sent. Run the activation again: the next build has a folder of its own"
+elif [ -z "$VERSION" ] && answer; then
   # This commit was sent before, by an earlier run (e.g. the update, and now a run by hand with activate: now) or an
   # earlier attempt of this one. A commit's publish request cannot be sent twice, so a version the cell published is
   # activated with a request of this run's own: with this run's activate and reason, and back to it after a rollback.
@@ -483,7 +541,8 @@ if [ -n "${FROM_STORE:-}" ]; then
   esac
 fi
 keep_answer
-[ "${STAGE:-}" = prod ] && [ -n "${FROM_STORE:-}" ] && release
+# A workflows package records no prod release: prod's current.json and history are a customization's (#1104 review).
+[ "${STAGE:-}" = prod ] && [ -n "${FROM_STORE:-}" ] && [ "$TYPE" != workflows ] && release
 STATUS=$(jq -r '.status // "unknown"' "$TMP/result.json")
 output status "$STATUS"
 outcome "$STATUS" --arg activation "$(jq -r '.activation // empty' "$TMP/result.json")" \

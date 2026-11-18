@@ -71,6 +71,21 @@ instead of a file: only paths on the edition's list are taken (docs/CUSTOMIZATIO
 Before a package reaches a cell, the delivery checks that the cell can apply what it uses: a package naming
 environment values (`parameters`) is refused for a cell whose edition cannot set them, and the run says why.
 
+## Workflows
+A customer's automations repository delivers its workflows the same way. `workflows/workflows.json` names the vendor id
+and the package, next to its workflows:
+```json
+{ "version": 1, "vendor": "acme", "package": "acme-automations", "flows": [ ... ] }
+```
+The package is the `workflows/` folder. It is checked with the same rules as the cell's deploy, using the function names
+in `functions/functions.json`, stored, and activated in the stage's cell by its own activation, which builds and deploys
+the workflows there; the job reports the cell's answer, as for a customization. The customer must allow
+workflows for your repository (`"types"` with `workflows`, in its delegation or once for all the customer's
+delegations); without it the package is stored, and its
+activation is refused with `AccessDenied`. It can take longer than a
+customization, so the wait is 40 minutes unless you set it. A repository that has both `customization.json` and
+`workflows/workflows.json` sets `PACKAGE_TYPE` to `censhare-custom` or `workflows` to say which one it delivers.
+
 ## GitLab CI
 GitLab vouches for the job with its OIDC token, which becomes the publisher role; no key is stored. The customer
 delegates your project's path and branch (or tag) the same way. Include the kit's template and extend its job:
@@ -90,7 +105,7 @@ the branch and the push from GitLab's own variables (`CI_COMMIT_BRANCH`, `CI_PIP
 
 ## Check your package first
 `bin/validate.sh [folder]` runs the checks the cell runs on your package when it arrives, on your own checkout: no AWS,
-no network, only python3. It prints each problem and exits 1 when the cell would refuse the package. The Action and the
+no network, only python3 (Node for workflows). It prints each problem and exits 1 when the cell would refuse the package. The Action and the
 GitLab template run it before they store anything, so a package that would be refused fails your pipeline instead:
 ```sh
 git clone --depth 1 --branch <edition tag> https://github.com/entirely-workspace/hyperscaler-delivery.git /tmp/censhare-kit
@@ -101,7 +116,7 @@ secrets, and packages already active in the cell.
 
 ## Without the Action
 `bin/deliver.sh` is what the Action runs. Any CI can run it, with flags or with the same names as variables
-(`CUSTOMER`, `PACKAGES_BUCKET`, `STAGE`, ...). It needs bash, git, jq, python3 and the AWS CLI:
+(`CUSTOMER`, `PACKAGES_BUCKET`, `STAGE`, ...). It needs bash, git, jq, python3 and the AWS CLI, and Node for workflows:
 ```sh
 bash /tmp/censhare-kit/bin/deliver.sh --customer <customer> --packages-bucket <bucket> --stage dev \
   --publisher-role <publisher role ARN>

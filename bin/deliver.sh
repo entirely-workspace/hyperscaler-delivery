@@ -27,6 +27,13 @@
 # the kit): a package the cell would refuse is never stored. Without validate.sh next to it (an older copy in a
 # repository's tools/, #826), the cell alone checks it.
 #
+# An automations repository's workflows (#762: workflows/workflows.json, which names their vendor and package) are a
+# package of their own type: checked by the workflow validator, stored with "type": "workflows" in the manifest, and
+# activated by their own type's activation, <customer>-<vendor>-<stage>-activate-workflows (#1071), whose cell builds
+# and deploys them; it can take longer than a customization's, so WAIT_MINUTES defaults to 40 for them. A repository
+# with both customization.json and workflows/workflows.json says which it delivers with PACKAGE_TYPE (censhare-custom
+# or workflows).
+#
 # Exit: 0 the cell published or activated it, or a newer push superseded this one, 1 the activation failed or the cell
 # refused (or would refuse: the check before storing), 2 not sent.
 set -uo pipefail
@@ -64,6 +71,7 @@ if [ -n "$ROLE" ]; then
     AWS_CONFIG_FILE=/dev/null AWS_SHARED_CREDENTIALS_FILE=/dev/null
   unset AWS_PROFILE
 fi
+WAIT_GIVEN=${WAIT_MINUTES:-}
 STAGE=${STAGE:-dev} WAIT_MINUTES=${WAIT_MINUTES:-20} POLL_SECONDS=${POLL_SECONDS:-10}
 case "$STAGE" in dev|test) ;; prod) fail "prod is never delivered by a partner: it takes the customer's approval (#781)" ;; *) fail "STAGE must be dev or test, not '$STAGE'" ;; esac
 [[ "$WAIT_MINUTES" =~ ^[0-9]+$ ]] || fail "WAIT_MINUTES (--wait-minutes) must be a whole number of minutes, not '$WAIT_MINUTES'"
@@ -87,6 +95,18 @@ else
   fi
   [ -n "${EVENT:-}" ] || { [ "${CI_PIPELINE_SOURCE:-}" = push ] && EVENT=push; }
 fi
+# The package's type, from the commit's files; publish.sh and validate.sh are told it, so all three agree.
+in_commit() { git cat-file -e "HEAD:./$1" 2>/dev/null; }
+case "${PACKAGE_TYPE:-}" in
+  "") if in_commit customization.json && in_commit workflows/workflows.json; then
+        fail "the commit has both customization.json and workflows/workflows.json: set PACKAGE_TYPE to censhare-custom or workflows"
+      elif in_commit workflows/workflows.json; then PACKAGE_TYPE=workflows; else PACKAGE_TYPE=censhare-custom; fi ;;
+  censhare-custom|workflows) ;;
+  *) fail "PACKAGE_TYPE must be censhare-custom or workflows, not '$PACKAGE_TYPE'" ;;
+esac
+export PACKAGE_TYPE
+# Building and deploying the workflows stack takes longer than a customization's intake: unless given, wait longer.
+[ "$PACKAGE_TYPE" = workflows ] && [ -z "$WAIT_GIVEN" ] && WAIT_MINUTES=40
 tip() {
   [ -n "$TAG" ] && return 0
   rm -f "$TMP/tip.json"
@@ -99,13 +119,20 @@ tip
 # 1a. Checked as the cell's intake checks it, before anything is stored: a refused package never reaches the store.
 # Exactly the files publish.sh stores (customization.json and the source folder's committed files, as the commit has
 # them): not the working tree's other folders or ignored files, and no export-ignore or export-subst in the way.
+# Workflows: the workflows/ folder, and the function names they may call (functions/functions.json, or a functions.json
+# at the root), which are not stored with them.
 if [ -f "$HERE/validate.sh" ]; then
-  SRC=$(git show HEAD:./customization.json 2>/dev/null | jq -r '.source // empty' 2>/dev/null)
+  if [ "$PACKAGE_TYPE" = workflows ]; then
+    CHECKED=(workflows functions/functions.json functions.json)
+  else
+    SRC=$(git show HEAD:./customization.json 2>/dev/null | jq -r '.source // empty' 2>/dev/null)
+    CHECKED=(customization.json ${SRC:+"$SRC"})
+  fi
   mkdir -p "$TMP/commit"
   while IFS= read -r -d '' f; do
     mkdir -p "$TMP/commit/$(dirname "$f")" && git show "HEAD:./$f" > "$TMP/commit/$f" 2>/dev/null \
       || fail "could not read $f from the commit to check it (commit your changes first)"
-  done < <(git ls-files -z -- customization.json ${SRC:+"$SRC"})
+  done < <(git ls-files -z -- "${CHECKED[@]}")
   KIT=$(cat "$HERE/../VERSION" 2>/dev/null || echo "this repository's")
   echo "checking the package as the cell's intake does (the validator of kit $KIT; the cell's own check decides)"
   bash "$HERE/validate.sh" "$TMP/commit"
@@ -128,6 +155,8 @@ overrides=$(jq -nc --arg d "$DIGEST" --arg a "${ACTIVATE:-}" --arg r "${REASON:-
   '[{name: "FROM_STORE", value: $d}] + (if $a == "" then [] else [{name: "ACTIVATE", value: $a}] end)
      + (if $r == "" then [] else [{name: "REASON", value: $r}] end) | map(. + {type: "PLAINTEXT"})')
 project="$CUSTOMER-$VENDOR-$STAGE-activate"
+# A workflows package has its own activation (#1071): the same gates, its cell's workflows deployer instead of the intake.
+[ "$PACKAGE_TYPE" = workflows ] && project="$project-workflows"
 # Test activates one at a time (the customer API's promotes and pipelines alike), and CodeBuild refuses a start over a
 # project's limit instead of queueing it: while another activation runs, this one waits its turn, within WAIT_MINUTES,
 # and is still the tip before each retry (else it ends as step 0 does: superseded green, otherwise refused).
@@ -135,7 +164,7 @@ waited=0
 until build=$(aws codebuild start-build --project-name "$project" --environment-variables-override "$overrides" \
                 --query build.id --output text 2>"$TMP/err"); do
   grep -q AccountLimitExceededException "$TMP/err" \
-    || fail "could not start $project: $(tr '\n' ' ' < "$TMP/err")(is this pipeline delegated for $STAGE?)"
+    || fail "could not start $project: $(tr '\n' ' ' < "$TMP/err")(is this pipeline delegated for $STAGE$([ "$PACKAGE_TYPE" = workflows ] && echo ', and for workflows: "types" in its delegation or the customer file'?)"
   [ "$waited" -ge $((WAIT_MINUTES * 60)) ] && fail "another activation of $project still runs after $WAIT_MINUTES minutes: try again later"
   [ "$waited" = 0 ] && echo "another activation of $project runs; waiting for it to end"
   sleep "$POLL_SECONDS"; waited=$((waited + (POLL_SECONDS > 0 ? POLL_SECONDS : 1)))

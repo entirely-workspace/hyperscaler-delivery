@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "workflow.step-changed",
+  "description": "An asset moved to another workflow step (AssetEvent/wf-changed). The workflow and step are the event's, not the asset's. Source censhare.server (docs/EVENTS.md).",
+  "type": "object",
+  "required": [
+    "version",
+    "assetId"
+  ],
+  "properties": {
+    "version": {
+      "const": 1,
+      "description": "The detail's schema version. Raised only for a change a subscriber could break on; a new member is not one."
+    },
+    "assetId": {
+      "type": "integer",
+      "description": "censhare asset id."
+    },
+    "assetVersion": {
+      "type": "integer",
+      "description": "The asset version the event is about."
+    },
+    "userId": {
+      "type": "integer",
+      "description": "censhare party id of the user whose action raised the event, when censhare records one."
+    },
+    "serviceIdentity": {
+      "type": "string",
+      "description": "When the user is an automation's own censhare person (id_extern cognito:<client id>): its Cognito app client id. Absent for a person."
+    },
+    "name": {
+      "type": "string",
+      "description": "Asset name, read when the event was published."
+    },
+    "type": {
+      "type": "string",
+      "description": "censhare asset type, e.g. picture., text., product.item."
+    },
+    "domain": {
+      "type": "string",
+      "description": "censhare domain, e.g. root.solution-admin.organization.media."
+    },
+    "domain2": {
+      "type": "string",
+      "description": "censhare second domain."
+    },
+    "workflowId": {
+      "type": "integer",
+      "description": "Workflow id."
+    },
+    "workflowStep": {
+      "type": "integer",
+      "description": "Workflow step."
+    },
+    "previousWorkflowId": {
+      "type": "integer",
+      "description": "The workflow before; absent when there was none."
+    },
+    "previousWorkflowStep": {
+      "type": "integer",
+      "description": "The step before; absent when there was none."
+    },
+    "correlationId": {
+      "type": "string",
+      "pattern": "^1-[0-9a-f]{8}-[0-9a-f]{24}$",
+      "description": "The X-Ray trace id the server gave the event when it published it (#1088). EventBridge passes it on to the run the event starts, and the server log line for the event names it too."
+    }
+  },
+  "additionalProperties": true
+}
