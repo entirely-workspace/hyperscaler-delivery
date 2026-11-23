@@ -1,0 +1,29 @@
+name: Deliver to the extra dev cells
+# censhare HyperScaler partner kit v2026.11.23-daa83428. Each push to any branch goes to the customer's extra dev cells that
+# follow this repository and that branch (each cell's Solution Console, Deployments tab), at once. A push no cell follows
+# ends green with nothing delivered. Never a stage: main and test go through deliver.yml.
+on:
+  push:
+    branches: ['**']
+# GitHub vouches for this workflow with its OIDC token; no key is stored. Each cell's own role trusts only the branch the
+# cell follows, so this token is what proves the branch.
+permissions: { id-token: write, contents: read }
+concurrency:
+  group: censhare-dev-cells-${{ github.ref_name }}
+  cancel-in-progress: false
+jobs:
+  deliver:
+    # Only once the customer delegated the extra dev cells to this repository.
+    if: vars.CENSHARE_DEV_CELLS_ROLE != ''
+    runs-on: ubuntu-latest
+    # deliver.sh waits for the cells' answers (20 minutes by default): a hang ends here, not after GitHub's 6 hours.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: entirely-workspace/hyperscaler-delivery@v2026.11.23-daa83428
+        with:
+          customer: ${{ vars.CENSHARE_CUSTOMER }}
+          packages-bucket: ${{ vars.CENSHARE_PACKAGES_BUCKET }}
+          # The role of the customer's delegation to the extra dev cells (any branch of this repository).
+          publisher-role: ${{ vars.CENSHARE_DEV_CELLS_ROLE }}
+          dev-cells: true

@@ -23,8 +23,8 @@ Errors refuse the package (exit 1); warnings are printed and pass (exit 0). No A
 partner's CI runs it, and publish-customization.sh runs it before it uploads anything.
 
   * owns: the same rules as publish-customization.sh's own_ok and the cell's entrypoint _own_ok (kept identical;
-    tests/test-validate-customization.sh compares all three), every owned path present, and every exclude inside an
-    owned path.
+    tests/test-validate-customization.sh compares all three), every owned path present - a file for the two the rules
+    allow as one file (own_file, #1353), a folder for every other - and every exclude inside an owned path.
   * touchesMasterdata false with masterdata in the package is an error: masterdata cannot be rolled back by files
     (§5.3), so carrying it must be declared.
   * Credentials in the package's files: a private key or an AWS access key is an error, anything that looks like a
@@ -55,6 +55,10 @@ KNOWN = {'vendor', 'package', 'source', 'owns', 'excludes', 'replaces', 'setting
          *V2_FIELDS}   # settings: #343, checked by docker/censhare-server/customer-settings.sh in publish-customization.sh
 # and at boot; secrets: #450, below; parameters: #942 (decision 0025), below
 NAME = re.compile(r'^[a-z0-9_-]+$')
+# Top-level prefixes of the customizations bucket that are not a vendor's: the intake's uploads (incoming/), the
+# server's report (_cell/running.json), the cell's captures (captures/, #1206) and the config manager's history
+# (config-history/, #812). A package published under one would land among them.
+RESERVED_VENDORS = {'incoming', '_cell', 'captures', 'config-history'}
 VERSION_RANGE = re.compile(r'^(?:(?:>=|<=|>|<|=)?\d{4}\.\d+(?:\.\d+)*)(?: (?:>=|<=|>|<|=)?\d{4}\.\d+(?:\.\d+)*)*$')
 CONTRACT = 1   # the delivery contract this edition implements; publish-customization.sh writes it into manifest.json
 
@@ -72,12 +76,22 @@ def own_ok(p):
         return False
     if p == 'app/modules/hyperscaler' or p.startswith('app/modules/hyperscaler/'):
         return False
+    if p in ('app/modules/event_forward_eventbridge/publish.xml', 'app/modules/event_forward_eventbridge/publish-masterdata.xml'):
+        return True
     if p == 'app/modules/event_forward_eventbridge' or p.startswith('app/modules/event_forward_eventbridge/'):
         return False
     if p.startswith(('app/web/src/hyperscaler', 'app/web/src/acme', 'app/web/src/ng1', 'app/web/sass')) \
             or p == 'app/web/cs' or p.startswith('app/web/cs/'):
         return False
     return re.match(r'^app/[^/]+/.+$', p) is not None
+
+# The owned paths that are ONE file, not a folder (#1353): the EventBridge publisher's two command files, which own_ok
+# allows as exact files. customizations.sh's _own_file and publish-customization.sh's own_file, the same list.
+OWN_FILES = ('app/modules/event_forward_eventbridge/publish.xml', 'app/modules/event_forward_eventbridge/publish-masterdata.xml')
+
+def own_file(p):
+    """Whether an owned path is one file (delivered as that file) rather than a folder (#1353)."""
+    return p in OWN_FILES
 
 PRIVATE_KEY = re.compile(rb'-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----')
 AWS_KEY_ID = re.compile(rb'\b(?:AKIA|ASIA)[0-9A-Z]{16}\b')
@@ -193,6 +207,8 @@ def check_fields(spec, r, strict_fields):
     for k in ('vendor', 'package'):
         if isinstance(spec.get(k), str) and spec[k] and not NAME.match(spec[k]):
             r.error(f'"{k}" must be lower-case [a-z0-9_-], not "{spec[k]}"')
+    if isinstance(spec.get('vendor'), str) and spec['vendor'] in RESERVED_VENDORS:   # a list or object is reported above
+        r.error(f'"vendor" "{spec["vendor"]}" is reserved: the customizations bucket uses that prefix for something else')
     for k in ('owns', 'excludes'):
         if k in spec and not (isinstance(spec[k], list) and all(isinstance(x, str) for x in spec[k])):
             r.error(f'"{k}" must be a list of paths')
@@ -382,7 +398,7 @@ def named_values_problems(field, limit, values, owns):
             out.append(f'{field}[{i}].name must be lower-case a-z, 0-9 and -, at most 63 characters')
         elif not isinstance(f, str) or not SECRET_FILE.match(f) or re.search(r'(^|/)\.\.(/|$)|//', f):
             out.append(f'{field}[{i}].file must be the path of an XML file under app/, without .. or //')
-        elif not any(f.startswith(o + '/') for o in owns if isinstance(o, str)):
+        elif not any(f == o or f.startswith(o + '/') for o in owns if isinstance(o, str)):   # ==: an owned file (#1353)
             out.append(f'{field}[{i}].file {f} is not inside a path the package owns')
         elif ('attribute' in e) == ('path' in e):
             out.append(f'{field}[{i}] needs attribute or path, one of them')
@@ -479,6 +495,10 @@ def package_files(source, owns, excludes):
     """(owned path, path relative to source) for every file the package delivers, excludes applied."""
     for own in owns:
         base = os.path.join(source, own)
+        if own_file(own):   # one file (#1353): that file only
+            if os.path.isfile(base):
+                yield own, own
+            continue
         for dirpath, dirs, files in os.walk(base):
             rel_dir = os.path.relpath(dirpath, source)
             dirs[:] = sorted(d for d in dirs if not any(
@@ -529,9 +549,12 @@ def main(argv):
         bad = [o for o in owns if not own_ok(o)]
         if bad:
             r.error(f'claims paths a package may not own: {", ".join(bad)}')
-        missing = [o for o in owns if own_ok(o) and not os.path.isdir(os.path.join(source, o))]
+        # A file for an owned file (#1353), a folder for every other owned path.
+        missing = [o for o in owns if own_ok(o)
+                   and not (os.path.isfile if own_file(o) else os.path.isdir)(os.path.join(source, o))]
         if missing:
-            r.error(f'owned paths missing under {spec["source"]}: {", ".join(missing)}')
+            r.error(f'owned paths missing under {spec["source"]}: '
+                    + ', '.join(f'{o} ({"a file" if own_file(o) else "a folder"})' for o in missing))
         owns = [o for o in owns if own_ok(o) and o not in missing]
         for ex in excludes:
             if not any(ex.startswith(o + '/') for o in owns):

@@ -31,8 +31,14 @@ inputs:
     description: The folder with customization.json.
     default: .
   wait-minutes:
-    description: How long to wait for the cell's answer. Empty, the default, is 20 minutes for a customization and 40 for workflows.
+    description: How long to wait for the cell's answer. Empty, the default, is 20 minutes for a customization and 40 for workflows or functions.
     default: ''
+  dev-cells:
+    description: >
+      true: deliver this push to the customer's extra dev cells that follow this repository and branch (set in each
+      cell's Solution Console), at once, never to a stage. publisher-role is then the role of the customer's
+      delegation to the extra dev cells; each cell's own role starts it, and trusts only the branch the cell follows.
+    default: 'false'
 runs:
   using: composite
   steps:
@@ -52,9 +58,14 @@ runs:
       env:
         CUSTOMER: ${{ inputs.customer }}
         PACKAGES_BUCKET: ${{ inputs.packages-bucket }}
-        STAGE: ${{ inputs.stage }}
-        ACTIVATE: ${{ inputs.activate }}
+        STAGE: ${{ inputs.dev-cells != 'true' && inputs.stage || '' }}
+        # An extra dev cell takes a push at once (deliver.sh's default with DEV_CELLS). Not `cond && '' || x`: an
+        # empty string is false in an expression, so that always gives x.
+        ACTIVATE: ${{ inputs.dev-cells != 'true' && inputs.activate || '' }}
         REASON: ${{ inputs.reason }}
+        DEV_CELLS: ${{ inputs.dev-cells == 'true' && 'yes' || '' }}
+        # Where the push came from: the Solution Console shows it, and an extra dev cell follows it.
+        SOURCE_REPOSITORY: ${{ github.repository }}
         WAIT_MINUTES: ${{ inputs.wait-minutes }}
         GH_TOKEN: ${{ github.token }}   # read-only: whether this commit is still the branch's tip (deliver.sh)
       run: bash "$GITHUB_ACTION_PATH/bin/deliver.sh"

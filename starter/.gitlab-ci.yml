@@ -1,10 +1,10 @@
-# censhare HyperScaler partner kit v2026.11.18-bf3bb58b. Each push to a delegated branch stores this commit's package once, by
+# censhare HyperScaler partner kit v2026.11.23-daa83428. Each push to a delegated branch stores this commit's package once, by
 # digest, in the customer's package store and activates it in that branch's stage: main → dev, test → test (only if
 # the customer delegated test to you). Prod is never delivered by a pipeline: the customer approves the package test ran.
 # CI/CD variables: CENSHARE_CUSTOMER, CENSHARE_PACKAGES_BUCKET, CENSHARE_PUBLISHER_ROLE (main's), and
 # CENSHARE_PUBLISHER_ROLE_TEST if test is delegated: each delegated branch has its own role, which trusts that branch only.
 include:
-  - remote: https://raw.githubusercontent.com/entirely-workspace/hyperscaler-delivery/v2026.11.18-bf3bb58b/gitlab/deliver.gitlab-ci.yml
+  - remote: https://raw.githubusercontent.com/entirely-workspace/hyperscaler-delivery/v2026.11.23-daa83428/gitlab/deliver.gitlab-ci.yml
 
 deliver-dev:
   extends: .censhare-deliver
@@ -28,3 +28,14 @@ deliver-test:
   rules:
     - if: $CI_COMMIT_BRANCH == "test" && $CI_PIPELINE_SOURCE == "push"
   resource_group: censhare-deliver-test
+
+# The extra dev cells (#1189), once the customer delegated them to this project (CI/CD variable CENSHARE_DEV_CELLS_ROLE):
+# each push to any branch goes to the cells that follow this project and branch (each cell's Solution Console), at once.
+deliver-dev-cells:
+  extends: .censhare-deliver-dev-cells
+  before_script:
+    - !reference [.censhare-deliver, before_script]
+    - export CENSHARE_PUBLISHER_ROLE="$CENSHARE_DEV_CELLS_ROLE"
+  rules:
+    - if: $CENSHARE_DEV_CELLS_ROLE && $CI_COMMIT_BRANCH && $CI_PIPELINE_SOURCE == "push"
+  resource_group: censhare-dev-cells-$CI_COMMIT_REF_SLUG

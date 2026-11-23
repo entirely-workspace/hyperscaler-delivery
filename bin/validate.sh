@@ -4,7 +4,7 @@
 # In the partner kit it is bin/validate.sh, next to bin/validate-customization.py; deliver.sh runs it before it stores
 # anything, so a package the cell would refuse fails in the partner's CI and never reaches the store.
 #
-#   validate.sh [<folder with customization.json or workflows/>, default .] [validator options, e.g. --strict-fields]
+#   validate.sh [<folder with customization.json, workflows/ or functions/>, default .] [validator options, e.g. --strict-fields]
 #
 # What it can't check here, the cell still does: the edition's censhare assets a variant replaces (the intake has the
 # edition's index; here a missing checksum is only a warning), the customer's settings and secrets, and collisions with
@@ -12,22 +12,42 @@
 #
 # A workflows package (#762), a folder with workflows/workflows.json, is checked by the workflow validator instead: the
 # deploy's own checks (lib/workflow-validate-cli.ts; in the kit compiled into lib/, with the event schemas in
-# docs/events/), which needs Node. PACKAGE_TYPE (censhare-custom or workflows) says which when the folder has both.
+# docs/events/), which needs Node. A functions package (#674), a folder with functions/functions.json and neither of the
+# others, is checked by the functions validator (lib/function-validate-cli.ts): the deploy's rules for functions.json,
+# and each function's zip, which the customer's CI built before (there, a regular file, a zip, at most 250 MB
+# unpacked). PACKAGE_TYPE (censhare-custom, workflows or functions) says which when the folder has more than one.
 #
 # Exit: 0 passes (warnings are printed), 1 refused (the reasons are printed), 2 could not check.
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 DIR=.
 [ $# -gt 0 ] && [ "${1#-}" = "$1" ] && { DIR=$1; shift; }
-case "${1:-}" in -h|--help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;; esac
+case "${1:-}" in -h|--help) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;; esac
 fail() { echo "error: $*" >&2; exit 2; }
 case "${PACKAGE_TYPE:-}" in
   "") if [ -f "$DIR/customization.json" ] && [ -f "$DIR/workflows/workflows.json" ]; then
         fail "$DIR has both customization.json and workflows/workflows.json: set PACKAGE_TYPE to censhare-custom or workflows"
-      elif [ -f "$DIR/workflows/workflows.json" ]; then TYPE=workflows; else TYPE=censhare-custom; fi ;;
-  censhare-custom|workflows) TYPE=$PACKAGE_TYPE ;;
-  *) fail "PACKAGE_TYPE must be censhare-custom or workflows, not '$PACKAGE_TYPE'" ;;
+      elif [ -f "$DIR/workflows/workflows.json" ]; then TYPE=workflows
+      elif [ ! -f "$DIR/customization.json" ] && [ -f "$DIR/functions/functions.json" ]; then TYPE=functions
+      else TYPE=censhare-custom; fi ;;
+  censhare-custom|workflows|functions) TYPE=$PACKAGE_TYPE ;;
+  *) fail "PACKAGE_TYPE must be censhare-custom, workflows or functions, not '$PACKAGE_TYPE'" ;;
 esac
+if [ "$TYPE" = functions ]; then
+  [ $# = 0 ] || fail "the functions validator takes no options ($*)"
+  [ -f "$DIR/functions/functions.json" ] || fail "no functions/functions.json in $DIR"
+  command -v node >/dev/null || fail "node is needed to check functions"
+  if [ -f "$HERE/../lib/function-validate-cli.js" ]; then
+    node "$HERE/../lib/function-validate-cli.js" "$DIR"
+  elif [ -f "$HERE/../../lib/function-validate-cli.ts" ]; then
+    abs=$(cd "$DIR" && pwd) && (cd "$HERE/../.." && node --require ts-node/register lib/function-validate-cli.ts "$abs")
+  else
+    fail "the functions validator is not next to $0"
+  fi
+  rc=$?
+  [ "$rc" -le 1 ] && exit "$rc"
+  exit 2
+fi
 if [ "$TYPE" = workflows ]; then
   [ $# = 0 ] || fail "the workflow validator takes no options ($*)"
   [ -f "$DIR/workflows/workflows.json" ] || fail "no workflows/workflows.json in $DIR"

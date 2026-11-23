@@ -19,6 +19,7 @@
 #   <vendor>/versions/<package>/<commit>.json             a customization commit's digest and its package's type (#762)
 #   <vendor>/versions/_workflows/<package>/<commit>.json  a workflows commit's (#1101 review): apart, so the Control
 #                                                         Center's version list never reads them (no package starts with _)
+#   <vendor>/versions/_functions/<package>/<commit>.json  a functions commit's (#674), apart for the same reason
 #   <vendor>/packages/<hex>/prod-approval.json            the customer's approval for prod (#781), written once
 #   <vendor>/prod/<package>/current.json, history/...     prod's release: what runs, and every promotion
 # A run with FROM_STORE=<digest> (and STORE_VENDOR) publishes a stored package instead of a checkout: from an empty
@@ -38,13 +39,26 @@
 #   WAIT_MINUTES    how long to wait for the cell's answer (default 10)
 #   PACKAGES_BUCKET the customer's package store (the caller's own credentials, never CELL_PROFILE)
 #   FROM_STORE      sha256:<hex>, the stored package to publish (run); STORE_VENDOR its vendor
-#   PACKAGE_TYPE    censhare-custom or workflows (#762); needed when the folder has both customization.json and
-#                   workflows/workflows.json. A workflows package is checked and stored (store, check); its manifest in
+#   PACKAGE_TYPE    censhare-custom, workflows (#762) or functions (#674). Without it: workflows/workflows.json makes it
+#                   workflows, functions/functions.json alone functions, else censhare-custom; a folder with both
+#                   customization.json and workflows/workflows.json must say which. A workflows package is checked and stored (store, check); its manifest in
 #                   the store says "type": "workflows" (a manifest without "type" is censhare-custom's). It reaches a cell
 #                   only from the store (#1071): run with FROM_STORE, with PACKAGE_TYPE=workflows (the workflows
 #                   activation sets it), into the cell's incoming-workflows/ for its workflows deployer, every activation
-#                   with the whole package. An activation of one type refuses a stored package of the other
-#   STAGE           the stage this run publishes for; names the answer kept in the store
+#                   with the whole package. An activation of one type refuses a stored package of the other.
+#                   functions (#674): functions/functions.json and each function's container image, which the
+#                   customer's CI built (the kit builds nothing): checked by the functions validator, each image pushed
+#                   into censhare's ECR (<CUSTOMER>/<vendor>-functions), which scans it (the customer stack records
+#                   each scan in the store when it ends; the activation hands them to the cell, which decides, #1422),
+#                   and stored with
+#                   functions/images.json, each image's repository and digest; like a workflows package it
+#                   reaches a cell only from the store, run with FROM_STORE and PACKAGE_TYPE=functions (the functions
+#                   activation, #674 step 3), into the cell's incoming-functions/ for its functions deployer (step 5).
+#                   The images are build output; functions.json must be committed
+#   SCAN_WAIT_SECONDS  the functions activation's wait for an image's scan to be recorded (#1422), 300 by default
+#   STORE_POINTER   no: store without the commit's version pointer (a delivery to the extra dev cells, #1189)
+#   STAGE           the stage this run publishes for, or the cell's id for an extra dev cell (#1189); names the answer
+#                   kept in the store
 #   OUTCOME_FILE    where to write what happened, as JSON, for whoever reports the result (#646, #781): status
 #                   (published, activated, refused, superseded, failed, timeout), version, package, files, digest,
 #                   activation, reason, validator, error, supersededBy. Empty: none written
@@ -53,6 +67,9 @@
 #
 # Exit: 0 published, activated or superseded, 1 refused by the cell, 2 a check here failed, 3 no answer in time.
 set -uo pipefail
+# This script's own path, resolved once (#1403 review): it calls itself again (__put) after push_images has changed into
+# its staging folder, where a relative $0 no longer names it.
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
 MODE="${1:-}"
 PARALLEL=16   # uploads at a time
@@ -185,11 +202,13 @@ from_store() {
 # file); say so, and what fixes it, instead.
 cell_reachable() {
   [ -n "${FROM_STORE:-}" ] && [ -n "${CELL_PROFILE:-}" ] || return 0
-  local err
+  local err entry="\"stage\": \"${STAGE:-?}\""
+  # An extra dev cell's activation is named after the cell, not a stage (#1189): its entry says devCell.
+  case "${STAGE:-}" in dev|test|prod|'') ;; *) entry='"devCell": true' ;; esac
   err=$(aws --profile "$CELL_PROFILE" sts get-caller-identity 2>&1 >/dev/null) && return 0
   case "$err" in
     *AccessDenied*|*NoSuchEntity*|*"not authorized"*)
-      fail "the cell ${CELL:-of stage ${STAGE:-?}} does not let this activation in as ${CELL_ROLE:-its publish role}: it is not set up to take ${STORE_VENDOR}'s packages from the store. In the cell's environment file, add the partner entry {\"vendor\": \"${STORE_VENDOR}\", \"delivery\": {\"customer\": ..., \"stage\": \"${STAGE:-?}\", \"account\": ...}} and deploy the cell (docs/RUNBOOK.md, \"A customer's package store\", step 4)" ;;
+      fail "the cell ${CELL:-of stage ${STAGE:-?}} does not let this activation in as ${CELL_ROLE:-its publish role}: it is not set up to take ${STORE_VENDOR}'s packages from the store. In the cell's environment file, add the partner entry {\"vendor\": \"${STORE_VENDOR}\", \"delivery\": {\"customer\": ..., $entry, \"account\": ...}} and deploy the cell (docs/RUNBOOK.md, \"A customer's package store\", step 4)" ;;
     *) fail "the cell ${CELL:-of stage ${STAGE:-?}} could not be reached as ${CELL_ROLE:-its publish role}: $(printf '%s' "$err" | tr '\n' ' ' | cut -c1-300)" ;;
   esac
 }
@@ -297,17 +316,21 @@ prod_gate() {
 # Its type (#762): which file the folder has. customization.json is a customization (censhare-custom), the package this
 # script publishes to a cell; workflows/workflows.json is an automations repository's workflows, which are stored
 # only, until the workflows activator (#1071) places them. A folder with both says which with PACKAGE_TYPE.
+# functions/functions.json alone (#674) is an automations repository's functions; with workflows/ next to it, deliver.sh
+# stores the functions first with PACKAGE_TYPE=functions, then the workflows.
 case "${PACKAGE_TYPE:-}" in
   "") if [ -f customization.json ] && [ -f workflows/workflows.json ]; then
         fail "this folder has both customization.json and workflows/workflows.json: set PACKAGE_TYPE to censhare-custom or workflows"
       elif [ -f workflows/workflows.json ]; then TYPE=workflows
+      elif [ ! -f customization.json ] && [ -f functions/functions.json ]; then TYPE=functions
       else TYPE=censhare-custom; fi ;;
-  censhare-custom|workflows) TYPE=$PACKAGE_TYPE ;;
-  *) fail "PACKAGE_TYPE must be censhare-custom or workflows, not '$PACKAGE_TYPE'" ;;
+  censhare-custom|workflows|functions) TYPE=$PACKAGE_TYPE ;;
+  *) fail "PACKAGE_TYPE must be censhare-custom, workflows or functions, not '$PACKAGE_TYPE'" ;;
 esac
 case "$TYPE" in
   censhare-custom) MANIFEST=customization.json ;;
   workflows) MANIFEST=workflows/workflows.json ;;
+  functions) MANIFEST=functions/functions.json ;;
 esac
 [ -f "$MANIFEST" ] || fail "no $MANIFEST here ($(pwd)); set working-directory to the folder that has it"
 jq -e 'type == "object"' "$MANIFEST" >/dev/null 2>&1 || fail "$MANIFEST is not a JSON object"
@@ -322,9 +345,13 @@ if [ "$TYPE" = workflows ]; then SOURCE=workflows; else SOURCE=$(jq -r '.source 
 if [ "$TYPE" = workflows ] && { { [ "$MODE" = run ] && [ -z "${FROM_STORE:-}" ]; } || [ -n "$VERSION" ]; }; then
   fail "a workflows package reaches a cell only from the store: deliver it (deliver.sh), or activate a stored digest (FROM_STORE)"
 fi
+# Functions the same way (#674 step 3): from the store only, by digest, into the cell's functions intake.
+if [ "$TYPE" = functions ] && { { [ "$MODE" = run ] && [ -z "${FROM_STORE:-}" ]; } || [ -n "$VERSION" ]; }; then
+  fail "a functions package reaches a cell only from the store: deliver it (deliver.sh), or activate a stored digest (FROM_STORE)"
+fi
 case "$ACTIVATE" in next-boot|now) ;; *) fail "activate must be next-boot or now, not '$ACTIVATE'" ;; esac
 # Workflows go live when the cell deploys them, without a restart: activate and its reason do not apply (the notice below).
-if [ "$ACTIVATE" = now ] && [ "$TYPE" != workflows ] && [ -z "${REASON//[[:space:]]/}" ]; then
+if [ "$ACTIVATE" = now ] && [ "$TYPE" = censhare-custom ] && [ -z "${REASON//[[:space:]]/}" ]; then
   fail "activate: now restarts the customer's server: give a reason"
 fi
 [[ "$WAIT_MINUTES" =~ ^[0-9]{1,3}$ ]] || fail "wait-minutes must be a number of minutes, not '$WAIT_MINUTES'"
@@ -334,6 +361,37 @@ WAIT_SECONDS=$((10#$WAIT_MINUTES * 60))
 if [ "$MODE" != store ] && [ -n "${GITHUB_REF:-}" ] && [ "$GITHUB_REF" != "refs/heads/$BRANCH" ]; then
   fail "only $BRANCH publishes or rolls back (this is $GITHUB_REF)"
 fi
+
+# image_scans (the functions activation, #1422): each image's scan, as the customer stack's scan writer recorded it in
+# the store when the scan ended (_scans/<repository>/<digest hex>.json), into the request: the cell decides from them,
+# and reads no scan itself. A scan not recorded yet is waited for, at most SCAN_WAIT_SECONDS; then nothing is sent.
+image_scans() {
+  local limit=${SCAN_WAIT_SECONDS:-300} poll=${SCAN_POLL_SECONDS:-10} scans='{}' name repo digest key waited rec got
+  [[ "$limit" =~ ^[0-9]{1,4}$ ]] && [[ "$poll" =~ ^[0-9]{1,3}$ ]] || fail "SCAN_WAIT_SECONDS and SCAN_POLL_SECONDS are seconds"
+  [ -f functions/images.json ] || fail "the stored package has no functions/images.json"
+  while IFS=$'\t' read -r name repo digest; do
+    [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "functions/images.json: image $name has no digest"
+    # Its repository without the registry: <customer>/<vendor>-functions, the vendor's own (the activation reads no other).
+    repo=${repo#*/}
+    [[ "$repo" == */"$VENDOR-functions" ]] || fail "functions/images.json: image $name is in $repo, not $VENDOR's repository"
+    key="_scans/$repo/${digest#sha256:}.json"; waited=0
+    # Before this run's temporary folder exists: a file of its own, removed below.
+    got=$(mktemp)
+    until aws s3api get-object --bucket "$PACKAGES_BUCKET" --key "$key" "$got" >/dev/null 2>&1; do
+      if [ "$waited" -ge "$limit" ]; then
+        rm -f "$got"; fail "the scan of image $name ($digest) has not ended; activate again in a few minutes. If it never ends, ECR may not scan its base: build on one it can, such as an AWS Lambda base image"
+      fi
+      [ "$waited" = 0 ] && echo "waiting for the scan of image $name ($digest), at most ${limit}s"
+      sleep "$poll"; waited=$((waited + (poll > 0 ? poll : 1)))
+    done
+    rec=$(jq -ce 'select((.status | type) == "string" and (.critical | type) == "number") | {status, critical}' "$got" 2>/dev/null)
+    rm -f "$got"
+    [ -n "$rec" ] || fail "the scan record of image $name ($key) is not one the scan writer writes; nothing sent"
+    echo "scan of image $name: $(jq -r .status <<< "$rec"), $(jq -r .critical <<< "$rec") critical"
+    scans=$(jq -c --arg d "$digest" --argjson r "$rec" '. + {($d): $r}' <<< "$scans")
+  done < <(jq -r 'to_entries[] | [.key, .value.repository, .value.digest] | @tsv' functions/images.json)
+  REQUEST=$(jq -c --argjson s "$scans" '. + {scans: $s}' <<< "$REQUEST")
+}
 
 if [ -n "$VERSION" ]; then
   [[ "$VERSION" =~ $COMMIT_RE ]] || fail "version must be the full 40-character commit of a version already published (on the commit's page, copy the full SHA), not '$VERSION'"
@@ -351,6 +409,12 @@ elif [ -n "${FROM_STORE:-}" ] && [ "$MODE" = run ]; then
     REQUEST=$(jq -nc --arg c "$ID" --arg d "$DIGEST" '{action: "deploy", type: "workflows", commit: $c, digest: $d}')
     [ "$ACTIVATE" = now ] && echo "${N}activate: now does not apply to workflows: they go live when the cell deploys them, without a restart"
     WHAT="deploy the workflows of $VENDOR/$PACKAGE $DIGEST @ $ID from the store (${#FILES[@]} files)"
+  elif [ "$TYPE" = functions ]; then
+    # The cell's functions deployer (#674 step 5) checks the images and their scans (image_scans, below), deploys them
+    # and answers with the commit as the version, as the workflows deployer does. No restart: no activate or reason.
+    REQUEST=$(jq -nc --arg c "$ID" --arg d "$DIGEST" '{action: "deploy", type: "functions", commit: $c, digest: $d}')
+    [ "$ACTIVATE" = now ] && echo "${N}activate: now does not apply to functions: they go live when the cell deploys them, without a restart"
+    WHAT="deploy the functions of $VENDOR/$PACKAGE $DIGEST @ $ID from the store (${#FILES[@]} files)"
   else
     REQUEST=$(jq -nc --arg a "$ACTIVATE" --arg r "$REASON" \
       '{action: "publish", activate: $a} + (if $r == "" then {} else {reason: $r} end)')
@@ -358,12 +422,47 @@ elif [ -n "${FROM_STORE:-}" ] && [ "$MODE" = run ]; then
   fi
   [ "${STAGE:-}" = test ] && test_gate
   [ "${STAGE:-}" = prod ] && prod_gate
+  # After the gates: a start they refuse waits for no scan.
+  [ "$TYPE" = functions ] && image_scans
 else
   git rev-parse --git-dir >/dev/null 2>&1 || fail "not a git checkout: the version published is the commit"
-  [ -z "$(git status --porcelain)" ] || { git status --short >&2; fail "the working tree has changes: only a commit is published"; }
+  # Functions and workflows take committed files only (and the built zips, checked below): untracked build output, such
+  # as the functions' zips when an automations repository delivers its workflows after them, is not a change to them.
+  untracked=normal; [ "$TYPE" != censhare-custom ] && untracked=no
+  [ -z "$(git status --porcelain --untracked-files=$untracked)" ] \
+    || { git status --short --untracked-files=$untracked >&2; fail "the working tree has changes: only a commit is published"; }
   ID=$(git rev-parse HEAD)
   # Storing is not publishing: no stage branch to be the tip of.
   [ "$MODE" = store ] || current "before the upload"
+fi
+if [ -n "$VERSION" ] || { [ -n "${FROM_STORE:-}" ] && [ "$MODE" = run ]; }; then :
+elif [ "$TYPE" = functions ]; then
+  # functions/functions.json as committed, and the zips the customer's CI built next to it (build output, so not
+  # committed, and left out of the clean-tree check above only because they are not tracked): the functions validator
+  # checks them and names the package's files, each zip once.
+  git ls-files --error-unmatch -- "$MANIFEST" >/dev/null 2>&1 || fail "$MANIFEST is not committed: only a commit is published"
+  [ "$(git ls-files -s -- "$MANIFEST" | awk '{print $1}')" != 120000 ] || fail "$MANIFEST is a symlink, which is not published"
+  if [ "$MODE" = check ]; then
+    # check (deliver.sh reads the branch's tip with it) needs no zips: store checks them, and deliver.sh before it.
+    WHAT="the functions of $VENDOR/$PACKAGE @ $ID"
+  else
+    kit=$(dirname "$SELF")
+    # An image from the customer's own registry (#1412), pulled with this run's registry login before the check.
+    [ -f "$kit/pull-images.sh" ] || fail "pull-images.sh is not next to $SELF: an image from a registry cannot be pulled"
+    bash "$kit/pull-images.sh" "$MANIFEST" || fail "a function's image could not be pulled from its registry (above): nothing was stored"
+    if [ -f "$kit/../lib/function-validate-cli.js" ]; then
+      listed=$(node "$kit/../lib/function-validate-cli.js" --list .)
+    elif [ -f "$kit/../../lib/function-validate-cli.ts" ]; then
+      here=$(pwd); listed=$(cd "$kit/../.." && node --require ts-node/register lib/function-validate-cli.ts --list "$here")
+    else
+      fail "the functions validator is not next to $SELF"
+    fi || fail "the functions do not pass their check (above): nothing was stored"
+    IMAGES=()
+    while IFS= read -r i; do [ -n "$i" ] && IMAGES+=("$i"); done < <(printf '%s\n' "$listed" | tail -n +2)
+    [ "${#IMAGES[@]}" -gt 0 ] || fail "the functions validator named no images"
+    WHAT="store the functions of $VENDOR/$PACKAGE @ $ID (${#IMAGES[@]} image(s))"
+  fi
+else
   [ -n "$SOURCE" ] || fail "customization.json: \"source\" names the folder with censhare-Server's app/ (e.g. censhare-Custom/censhare-Server)"
   case "/$SOURCE/" in */../*|*/./*|//*) fail "customization.json: \"source\" must be a folder inside the repository, not '$SOURCE'" ;; esac
   [ -d "$SOURCE" ] || fail "customization.json: \"source\" folder '$SOURCE' does not exist"
@@ -392,6 +491,8 @@ BASE="incoming/$VENDOR/$PACKAGE/$ID"
 # A workflows package (#1071): its own intake, and a folder of its own per activation, with every file. The cell keeps no
 # workflows versions to activate again, and incoming files expire: each activation, a rollback too, brings the package.
 [ "$TYPE" = workflows ] && BASE="incoming-workflows/$VENDOR/$PACKAGE/$ID-$RUN"
+# A functions package (#674 step 3): the same, into the cell's functions intake.
+[ "$TYPE" = functions ] && BASE="incoming-functions/$VENDOR/$PACKAGE/$ID-$RUN"
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 # Still before anything is sent (#1095).
 [ "$MODE" = run ] && cell_fields_check
@@ -405,15 +506,94 @@ upload() {
      && [ -z "${CELL_PROFILE:-}" ] && [ -z "${HTTPS_PROXY:-}${https_proxy:-}${ALL_PROXY:-}${all_proxy:-}" ]; then
     BUCKET="$BUCKET" PARALLEL="$PARALLEL" python3 "$UPLOAD_PY"
   else
-    BUCKET="$BUCKET" CELL_PROFILE="${CELL_PROFILE:-}" xargs -0 -n 2 -P "$PARALLEL" bash "$0" __put
+    BUCKET="$BUCKET" CELL_PROFILE="${CELL_PROFILE:-}" xargs -0 -n 2 -P "$PARALLEL" bash "$SELF" __put
   fi
 }
 
 # store_package (publish.sh store): the files, then the manifest, which is what says the package is complete, then the
 # commit's pointer. Written once: a second run finds them there (412) and changes nothing.
+# push_images (store, functions, #674): each image the CI built, pushed into the vendor's repository in censhare's ECR
+# (<customer>/<vendor>-functions, in the account the publisher role is in), and the package staged:
+# functions/functions.json as committed, and functions/images.json with each image's repository and digest. The digest
+# is what the cell runs, so the package digest pins the images too. A tag per run: the repository's tags are immutable.
+push_images() {
+  [[ "${CUSTOMER:-}" =~ ^[a-z][a-z0-9-]*$ ]] || fail "CUSTOMER is needed to push the functions' images (the customer id)"
+  command -v docker >/dev/null || fail "docker is needed to push the functions' images"
+  local account region registry repo image tag digest stage
+  account=$(aws sts get-caller-identity --query Account --output text) || fail "could not tell the delivery account"
+  region=${AWS_REGION:-${AWS_DEFAULT_REGION:-}}; [ -n "$region" ] || fail "AWS_REGION is needed to push the functions' images"
+  registry="$account.dkr.ecr.$region.amazonaws.com"; repo="$CUSTOMER/$VENDOR-functions"
+  aws ecr get-login-password --region "$region" | docker login --username AWS --password-stdin "$registry" >/dev/null \
+    || fail "could not sign in to $registry (is this pipeline delegated for functions: \"types\" in its delegation?)"
+  stage="$TMP/stage"; mkdir -p "$stage/functions"; cp "$MANIFEST" "$stage/functions/functions.json"
+  local images='{}' id pushed media name from
+  for image in "${IMAGES[@]}"; do
+    # An image from the customer's registry (#1412) is named by its last path segment (asset-check for
+    # ghcr.io/acme/asset-check@sha256:...), and images.json keeps where it came from.
+    name=$image; from=
+    case "$image" in */*) from=$image; name=${image%@*}; name=${name##*/} ;; esac
+    # The tag names the image's content (#1403 review): its name (at most 64 characters), its own ID and the commit. The
+    # repository's tags are immutable, so a run-based tag was refused on a retry where the CI has no run id (GitLab);
+    # a tag already there holds this very content, so it is used as it is.
+    id=$(docker image inspect --format '{{.Id}}' "$image") && [[ "$id" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "could not read the ID of $image"
+    # Two images with one name (two versions of one image, two registries, or one built next to one pulled) have two IDs,
+    # so two tags (#1414 review).
+    tag="$(printf '%s' "$name" | cut -c1-64)-${id:7:16}-${ID:0:12}"
+    if pushed=$(aws ecr describe-images --repository-name "$repo" --image-ids imageTag="$tag" --query 'imageDetails[0].imageDigest' --output text 2>/dev/null) \
+       && [[ "$pushed" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+      echo "$image is in $repo:$tag already: its content, so it is not pushed again"
+    else
+      docker tag "$image" "$registry/$repo:$tag" && docker push -q "$registry/$repo:$tag" >/dev/null \
+        || fail "could not push $image to $registry/$repo"
+    fi
+    # Lambda runs a single image, never an image index (#1403 review): a buildx build with its default provenance pushes
+    # an index. Refused here, before anything is stored, rather than by the cell's deploy after the commit's package is.
+    read -r digest media < <(aws ecr describe-images --repository-name "$repo" --image-ids imageTag="$tag" \
+      --query 'imageDetails[0].[imageDigest,imageManifestMediaType]' --output text) \
+      && [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "could not read the digest of $repo:$tag"
+    case "$media" in
+      *image.index*|*manifest.list*) fail "image $image was pushed as an image index ($media), and Lambda runs a single image: build it with docker buildx build --platform linux/arm64 --provenance=false (nothing was stored)" ;;
+    esac
+    # ECR scans the image on push; the customer stack records the scan when it ends, and the cell refuses a critical
+    # finding from that record (#1422). The kit reads no scan: enhanced scanning's reads span the whole account.
+    echo "pushed $image as $repo@$digest"
+    images=$(jq -c --arg i "$image" --arg r "$registry/$repo" --arg d "$digest" --arg s "$from" \
+      '. + {($i): ({repository: $r, digest: $d} + (if $s == "" then {} else {source: $s} end))}' <<< "$images")
+  done
+  jq --sort-keys . <<< "$images" > "$stage/functions/images.json"
+  cd "$stage" || fail "could not stage the functions package"
+  FILES=(functions/functions.json functions/images.json)
+  DIGEST="sha256:$(sha256 "${FILES[@]}" | sha256 | cut -d' ' -f1)"
+}
+
 store_package() {
   [ -n "${PACKAGES_BUCKET:-}" ] || fail "PACKAGES_BUCKET is required to store"
   [ -z "$VERSION" ] || fail "store stores a commit, not a version (VERSION)"
+  # A package's pointer apart from the customizations' (#1101 review): the Control Center lists those, newest first, and
+  # a busy automations repository would otherwise make it read through every workflows or functions push.
+  local pointer="$VENDOR/versions/$PACKAGE/$ID.json"
+  [ "$TYPE" = workflows ] && pointer="$VENDOR/versions/_workflows/$PACKAGE/$ID.json"
+  [ "$TYPE" = functions ] && pointer="$VENDOR/versions/_functions/$PACKAGE/$ID.json"
+  # One commit, one functions package (#1255 review). Its digest covers the zips the customer's CI built, and a build
+  # rarely gives the same bytes twice (a zip carries its build time), so a re-run or the same commit on the next stage
+  # branch makes another digest. The commit keeps the package first stored for it, which is what its pointer names and
+  # what was checked then: that one is reported, and this build is not stored. A customization or workflows package is
+  # committed files only, so its commit always gives the same digest and needs no such check.
+  if [ "$TYPE" = functions ]; then
+    local err first
+    if err=$(aws s3api get-object --bucket "$PACKAGES_BUCKET" --key "$pointer" "$TMP/first.json" 2>&1 >/dev/null); then
+      first=$(jq -r '.digest // empty' "$TMP/first.json" 2>/dev/null)
+      [[ "$first" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "the commit's pointer $pointer names no digest"
+      if [ "$first" != "$DIGEST" ]; then
+        echo "$VENDOR/$PACKAGE @ $ID was stored as $first already; this build ($DIGEST) is not stored"
+        DIGEST=$first
+        outcome stored
+        return 0
+      fi
+    else
+      case "$err" in *NoSuchKey*|*"(404)"*|*"Not Found"*) ;; *) fail "the commit's pointer could not be read: $err" ;; esac
+    fi
+  fi
   local at="$VENDOR/packages/${DIGEST#sha256:}"
   for f in "${FILES[@]}"; do printf '%s\0%s\0' "$at/files/$f" "$f"; done | ( BUCKET=$PACKAGES_BUCKET CELL_PROFILE= upload ) \
     || fail "the package could not be stored"
@@ -431,19 +611,38 @@ store_package() {
   case "$me" in arn:aws*:sts::*:assumed-role/*/*) publisher=${me#*:assumed-role/}; publisher=${publisher%%/*} ;; esac
   if [[ "$publisher" =~ ^[A-Za-z0-9_.-]+$ ]]; then
     jq -n --arg p "$publisher" '{publisher: $p}' > "$TMP/stored-by.json"
-    BUCKET=$PACKAGES_BUCKET CELL_PROFILE= bash "$0" __put "$at/stored-by/$publisher.json" "$TMP/stored-by.json" \
+    BUCKET=$PACKAGES_BUCKET CELL_PROFILE= bash "$SELF" __put "$at/stored-by/$publisher.json" "$TMP/stored-by.json" \
       || echo "${W}who stored the package could not be recorded: it is refused once a delegation of $VENDOR is revoked" >&2
   else
     echo "${W}not running as a role: who stored the package is not recorded" >&2
   fi
-  BUCKET=$PACKAGES_BUCKET CELL_PROFILE= bash "$0" __put "$at/manifest.json" "$TMP/manifest.json" \
+  BUCKET=$PACKAGES_BUCKET CELL_PROFILE= bash "$SELF" __put "$at/manifest.json" "$TMP/manifest.json" \
     || fail "the package's manifest could not be stored"
-  # A workflows package's pointer apart from the customizations' (#1101 review): the Control Center lists those, newest
-  # first, and a busy automations repository would otherwise make it read through every workflows push.
-  local pointer="$VENDOR/versions/$PACKAGE/$ID.json"
-  [ "$TYPE" = workflows ] && pointer="$VENDOR/versions/_workflows/$PACKAGE/$ID.json"
-  printf '%s\0%s\0' "$pointer" "$TMP/version.json" \
-    | ( BUCKET=$PACKAGES_BUCKET CELL_PROFILE= upload ) || fail "the commit's pointer could not be stored"
+  # A delivery to the extra dev cells (#1189, STORE_POINTER=no) stores the package but no pointer: the pointers are
+  # the versions every cell lists for promotion, and nothing is promoted from an extra dev cell. Its role may not write
+  # them either. The same commit pushed to the main branch later writes it then.
+  if [ "${STORE_POINTER:-yes}" = no ]; then
+    echo "stored without a version pointer: a delivery to the extra dev cells, never promoted"
+  else
+    printf '%s\0%s\0' "$pointer" "$TMP/version.json" \
+      | ( BUCKET=$PACKAGES_BUCKET CELL_PROFILE= upload ) || fail "the commit's pointer could not be stored"
+    # Two runs of one functions commit at once (#1255 review): both found no pointer and stored their build, and only the
+    # first pointer write counts (a 412 is "already there", done). So the pointer is read again: the digest it names is
+    # this commit's package, which this run reports, whichever build that was.
+    if [ "$TYPE" = functions ]; then
+      local now
+      aws s3api get-object --bucket "$PACKAGES_BUCKET" --key "$pointer" "$TMP/pointer.json" >/dev/null 2>&1 \
+        || fail "the commit's pointer could not be read back after storing"
+      now=$(jq -r '.digest // empty' "$TMP/pointer.json" 2>/dev/null)
+      [[ "$now" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "the commit's pointer $pointer names no digest"
+      if [ "$now" != "$DIGEST" ]; then
+        echo "$VENDOR/$PACKAGE @ $ID: another run stored this commit first, as $now; this build ($DIGEST) is not its package"
+        DIGEST=$now
+        outcome stored
+        return 0
+      fi
+    fi
+  fi
   echo "stored $VENDOR/$PACKAGE @ $ID as $DIGEST (${#FILES[@]} files)"
   outcome stored
 }
@@ -474,7 +673,7 @@ release() {
     || { echo "${W}prod runs $DIGEST, but current.json could not be written" >&2; return 0; }
   echo "prod release: $DIGEST${previous:+, replaces $previous}"
 }
-if [ "$MODE" = store ]; then store_package; exit 0; fi
+if [ "$MODE" = store ]; then [ "$TYPE" = functions ] && push_images; store_package; exit 0; fi
 
 # The cell's answer in BASE, once it has given one.
 answer() {
@@ -510,7 +709,7 @@ send() {
 # A workflows request goes into a folder of its own run (incoming-workflows/…/<commit>-<run>). One with an answer already
 # is an earlier build's: CodeBuild numbers start again at 1 when the project is made again, and the folders live 30 days.
 # That answer is not this run's, and the customization's "published before" path below is not for workflows (#1104 review).
-if [ "$TYPE" = workflows ] && answer; then
+if [ "$TYPE" != censhare-custom ] && answer; then
   rm -f "$TMP/result.json"
   fail "$BASE already has an answer, from an earlier build with the same number; nothing sent. Run the activation again: the next build has a folder of its own"
 elif [ -z "$VERSION" ] && answer; then
@@ -542,7 +741,7 @@ if [ -n "${FROM_STORE:-}" ]; then
 fi
 keep_answer
 # A workflows package records no prod release: prod's current.json and history are a customization's (#1104 review).
-[ "${STAGE:-}" = prod ] && [ -n "${FROM_STORE:-}" ] && [ "$TYPE" != workflows ] && release
+[ "${STAGE:-}" = prod ] && [ -n "${FROM_STORE:-}" ] && [ "$TYPE" = censhare-custom ] && release
 STATUS=$(jq -r '.status // "unknown"' "$TMP/result.json")
 output status "$STATUS"
 outcome "$STATUS" --arg activation "$(jq -r '.activation // empty' "$TMP/result.json")" \

@@ -86,6 +86,21 @@ activation is refused with `AccessDenied`. It can take longer than a
 customization, so the wait is 40 minutes unless you set it. A repository that has both `customization.json` and
 `workflows/workflows.json` sets `PACKAGE_TYPE` to `censhare-custom` or `workflows` to say which one it delivers.
 
+## Functions
+`functions/functions.json` in an automations repository means **deliver these functions**: it is a package of its own,
+not only the list of names workflows may call. It names the vendor id and the package, and each function's zip, which
+**your CI builds before the kit's step** (the kit builds nothing):
+```json
+{ "version": 1, "vendor": "acme", "package": "acme-automations", "build": { "root": "functions" },
+  "functions": [{ "name": "picture-label", "module": "picture-label", "bean": "pictureLabel", "mainClass": "...", "concurrency": 2 }] }
+```
+A function's zip is `functions/<module>/target/<module>-lambda.zip` (the Maven build's), or the path in its `zip`. Each
+zip must be a real zip, not a link, inside the repository, and unpack to at most 250 MB, as the zip declares it. Set a
+fixed build time (`project.build.outputTimestamp`), so one commit always builds the same zip: a commit keeps the package
+first stored for it, and a later build of the same commit is not stored again. With `workflows/` next to it, one run
+delivers the functions first, then the workflows. The customer must allow functions for your repository (`"types"` with
+`functions`; `workflows` never implies it), and only functions that workflows call (no `triggers`) are deployed for now.
+
 ## GitLab CI
 GitLab vouches for the job with its OIDC token, which becomes the publisher role; no key is stored. The customer
 delegates your project's path and branch (or tag) the same way. Include the kit's template and extend its job:
@@ -103,6 +118,19 @@ Optional: `CENSHARE_STAGE` (`dev`, or `test`), `CENSHARE_ACTIVATE` (`next-boot`,
 `CENSHARE_REGION` (`eu-central-1`). The template runs the kit's `bin/deliver.sh` at its own version; `deliver.sh` reads
 the branch and the push from GitLab's own variables (`CI_COMMIT_BRANCH`, `CI_PIPELINE_SOURCE`).
 
+## Extra dev cells
+A customer's extra dev cells each follow a repository and branch that their developer sets in the cell's Solution
+Console. With the customer's delegation to the extra dev cells (`CENSHARE_DEV_CELLS_ROLE`), a push to any branch goes
+to the cells that follow it, at once, never to a stage:
+- **GitHub Actions:** the starter's `.github/workflows/deliver-dev-cells.yml`, which runs this Action with
+  `dev-cells: true` and `publisher-role: ${{ vars.CENSHARE_DEV_CELLS_ROLE }}`.
+- **GitLab CI:** extend `.censhare-deliver-dev-cells` in a job that runs on every branch push, with
+  `CENSHARE_PUBLISHER_ROLE` set to `CENSHARE_DEV_CELLS_ROLE` (the starter's `deliver-dev-cells` job).
+
+`deliver.sh` starts each cell as that cell's own role, with the same OIDC token: the role trusts only the branch the cell
+follows. GitHub Enterprise Server and GHE.com work the same way, once the customer's delegation names your
+host.
+
 ## Check your package first
 `bin/validate.sh [folder]` runs the checks the cell runs on your package when it arrives, on your own checkout: no AWS,
 no network, only python3 (Node for workflows). It prints each problem and exits 1 when the cell would refuse the package. The Action and the
@@ -113,6 +141,16 @@ bash /tmp/censhare-kit/bin/validate.sh .
 ```
 A few checks need the cell and run only there: the censhare assets your variants replace, the customer's settings and
 secrets, and packages already active in the cell.
+
+## Take live changes back to git
+Command configuration saved in the Admin Client and hotfolder rules saved on the Hotfolder page change a cell live,
+outside your git. An admin of the cell downloads them with **Export changes** (Settings › Customizations), or you
+download a kept capture in the Solution Console's **Local changes** tab; in your clone, `bin/pull-back.sh` turns that
+file into a branch and a pull request, with your own git credentials:
+```sh
+bash /tmp/censhare-kit/bin/pull-back.sh --from capture-<cell>-<time>.zip [--into <branch>]
+```
+The guide says what it does, and what goes where from a test or prod cell.
 
 ## Without the Action
 `bin/deliver.sh` is what the Action runs. Any CI can run it, with flags or with the same names as variables

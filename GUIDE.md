@@ -33,7 +33,7 @@ Until then, mirror the repository to gitlab.com or GitHub, or use CodeCommit.
 ## Getting started
 1. **Agree on the package with the customer.** It needs:
    - your vendor id: lower-case letters, digits, `-` and `_`, starting with a letter or digit, for example `acme`
-     (`censhare`, `hyperscaler`, `incoming`, `incoming-workflows` and `workflows-deployer` are taken). censhare checks
+     (`censhare`, `hyperscaler`, `incoming`, `incoming-workflows`, `incoming-functions` and `workflows-deployer` are taken). censhare checks
      these when it sets up the delegation;
      `bin/validate.sh` checks only the characters;
    - a package name;
@@ -69,6 +69,19 @@ Until then, mirror the repository to gitlab.com or GitHub, or use CodeCommit.
   them; they go live at once, with no restart. A rollback is delivering the earlier commit again. The customer must
   allow workflows for your repository (`"types"` in its delegation, or for all of the customer's delegations); without it, the package is stored but the activation is
   refused (`AccessDenied` on `StartBuild`).
+- **Functions** (`functions/functions.json` with your vendor, package and, per function, the container `image` your CI
+  builds first, in any language, with Lambda's Runtime Interface Client; AWS's base images have it) go the same way,
+  before the workflows of the same push. The kit checks each image is there, linux/arm64 and at most 10 GB, pushes it
+  into your repository in censhare's ECR (scanned on push), then stores and activates the functions in the stage's
+  cell, which refuses an image with critical scan findings and runs each other image by its digest. The customer must allow `functions` for your
+  repository too. Build reproducibly, so a commit always gives the same images.
+  An image can also come from your own registry, by digest: `"image": "ghcr.io/acme/asset-check@sha256:..."`. The kit
+  pulls it for linux/arm64 with your job's own registry login, so sign in to that registry before the kit's step
+  (`docker login`, or `docker/login-action`; on GitHub, `GITHUB_TOKEN` with `packages: read` reads GHCR). Your login
+  stays in your CI: censhare never sees it and never contacts your registry. A tag is refused: a tag can move, a digest
+  cannot. One `functions.json` may mix both kinds.
+  To remove a function that a deployed workflow calls, remove the calls first, in a push that still has the function,
+  then the function in a later push. The functions go first, so a push that drops both is refused.
 - **When it takes effect.** By default, the cell takes the package at its next restart (`next-boot`). `now` restarts
   the customer's server straight away, so it needs a reason, which is kept in the cell's record. Warn the people
   working on that cell before you use it, also on dev and test. Workflows go live as soon as the cell has deployed
@@ -76,6 +89,21 @@ Until then, mirror the repository to gitlab.com or GitHub, or use CodeCommit.
 - **Only the tip of the branch is delivered.** A re-run of an older push, or a run that a newer push overtook, ends
   green and delivers nothing. The newer push is on its way.
 - **The result** shows in your pipeline. The customer's chosen contacts also get an email for each activation.
+
+## Extra dev cells
+A customer may have extra dev cells besides its dev stage, for example one per developer or per feature. Each one
+follows a repository and a branch that its developer chooses in that cell's Solution Console (Deployments tab).
+- **Push to any branch.** The kit's second pipeline (`deliver-dev-cells.yml` on GitHub, the `deliver-dev-cells` job on
+  GitLab) delivers the push to every extra dev cell that follows that repository and branch, and activates it at
+  once. A branch that no cell follows ends green, and nothing is delivered.
+- **What it needs from the customer:** a delegation to the extra dev cells for your repository. Its role is
+  `CENSHARE_DEV_CELLS_ROLE`. It trusts any branch of your repository, but it may only store the package and read which
+  cell follows which branch. Each extra dev cell has its own role, which trusts only the branch the cell follows, and
+  only that role can start the cell. Your pipeline's OIDC token proves the branch, so nothing here can be pointed at a
+  cell by editing the pipeline on another branch.
+- **Nothing is promoted from an extra dev cell.** Test and prod still take what dev accepted.
+- **"does not trust ... save its source again"**: the cell's record says it follows your branch, but its role does
+  not trust that branch. The customer's developer saves the cell's source again in its Solution Console.
 
 ## From dev to test to prod
 | Stage | Who moves a package there | What it takes |
@@ -107,6 +135,37 @@ revert it on `main` first.
 - **A cell that won't start with its packages** can be booted without them by censhare (safe mode), while the package
   is fixed.
 
+## Taking live changes back to git
+People change a cell live: command configuration saved in the Admin Client, hotfolder rules saved on the Hotfolder
+page. Those changes are in no package, so the next release doesn't carry them to the other cells, and nothing in
+your git shows them. The cell's Settings › Customizations page says whether the cell is in sync with its release.
+
+1. **An admin of the cell exports them**: **Export changes** on that page downloads `capture-<cell>-<time>.zip`, the
+   changed files and `capture.json` (which release the cell runs, what changed). Secrets and environment values are
+   never in it. The cell keeps each capture 30 days. The Solution Console's **Local changes** tab shows what differs
+   now, captures and downloads: for the cell's admins and release owners on every stage, and for its developers on a dev
+   cell, with no admin needed. The tab also shows the command below, ready to copy. The zip is yours: apply it to your
+   package however you like, by hand or with the helper below.
+2. **You pull them back**, optionally with the kit's helper, in a clean clone of the package's repository:
+   `bash /tmp/censhare-kit/bin/pull-back.sh --from capture-<cell>-<time>.zip [--into <branch>]`. It:
+   - starts a branch `pullback/<cell>/<vendor>/<package>/<yyyymmdd-hhmmss>` from the commit the cell runs, so the pull request holds
+     only the live changes, and a later change to the same file on your branch is a conflict there, never lost. That
+     commit must be on the branch the pull request goes into;
+   - copies each file into your package's source folder, adds its folder to `owns`, and writes the hotfolder rules
+     into `settings.ingest`. A folder in `owns` is replaced on every cell the package reaches: a file there that the
+     package doesn't hold is removed, live edits made on a test or prod cell included. The pull request names each
+     folder it adds;
+   - checks the package (`bin/validate.sh`), commits, pushes with your own git credentials, and opens the pull
+     request with `gh` or `glab` when they're installed; elsewhere it names the branch to open one from. If it stops
+     on the way, your clone is back where it was, except when the package check fails: then the branch stays checked
+     out with the files, uncommitted, for you to fix.
+3. **Merge and deliver** as usual. From then on your package owns those paths, and the cell is in sync again.
+
+Where the pull request goes: from a dev cell, into `--into` (the branch the cell delivers from) or the default branch;
+from a test or prod cell, always into the default branch, by a pull request. `--package` picks the package when the
+cell runs several, and one capture goes into one package; `--no-push` only commits. censhare never writes to your git.
+Master data (`app/masterdata/`) is never pulled back: a package carries it only with `"touchesMasterdata": true`.
+
 ## When something fails
 | You see | It means | Do |
 |---|---|---|
@@ -116,7 +175,25 @@ revert it on `main` first.
 | `dev has not accepted` | A promotion to test of a package dev never accepted | Deliver that commit to dev first |
 | The cell refused the package, with a reason | The cell's own checks refused it: a collision with another package, a missing setting or a missing asset | Fix it and push again. Ask the customer if it's their setting. |
 | Green, but "superseded" | A newer push is delivering | Nothing to do |
+| `runs several packages` (pull-back) | The cell runs more than one package | Name the one the changes belong in with `--package` |
+| `can be owned only as a file` (pull-back) | A live switch of the EventBridge publisher; a package can't own those files yet | Switch it on in your package's copy by hand, or on each cell in the Admin Client |
+| `would carry other commits too` (pull-back) | The commit the cell runs isn't on the branch the pull request would go into | Name the branch the cell delivers from with `--into` |
+| `is master data` or `would own the whole of` (pull-back) | A live change to master data, or to a file directly in `app/masterdata` or `app/assets` | Add it to your package by hand |
+| `is in no path a package may own` or `which no package may own` (pull-back) | A live change to what stays the cell's (its configuration, services, the image's own files) | Nothing to pull back: ask censhare if it must change |
 | `set PACKAGE_TYPE to censhare-custom or workflows` | The repository has both `customization.json` and `workflows/workflows.json` | Set `PACKAGE_TYPE` to the one this pipeline delivers |
+| The functions check says `functions/functions.json` has no "vendor" and "package" | `functions/functions.json` now means "deliver these functions", which needs both | Add the names censhare gave you |
+| `is not there: build it before the kit's step` | Your CI didn't build that image, or under another name | Build it first, under the name `image` gives |
+| `could not pull` and `sign in to its registry before the kit's step` | The job has no login that can read that registry, or the digest isn't there | Sign in before the kit's step, and check the digest in `image` |
+| `a registry reference needs a digest` | `image` names a registry image by tag | Use its digest: `<registry>/<name>@sha256:...` |
+| `the cells run linux/arm64` | The image was built for another platform | Build with `docker build --platform linux/arm64` |
+| `Lambda takes at most 10 GB` | The image is larger than Lambda takes | Make the image smaller |
+| `was pushed as an image index` | Your build pushed a list of images (buildx's default provenance), and Lambda runs a single image | Build with `docker buildx build --platform linux/arm64 --provenance=false` |
+| The cell refused the functions, naming critical findings in ECR's scan | ECR's scan found a critical vulnerability in the image | Update the base image or the package it names, and push again |
+| The cell refused the functions: ECR's scan of an image ended other than complete (such as UNSUPPORTED_IMAGE or FAILED) | ECR couldn't scan the image, for example one with no package list ECR knows, such as a `scratch` or distroless base | Build it on a base image ECR can scan, such as an AWS Lambda base image |
+| The activation failed: `has not ended; activate again in a few minutes` | ECR's scan of the image hadn't ended within 5 minutes, or never will for a base ECR can't scan | Activate again in a few minutes; if it keeps failing, build on an AWS Lambda base image |
+| The cell refuses a function with an HTTP trigger | Only functions that workflows call are deployed for now | Remove `triggers` |
+| The cell refuses functions.json: it leaves out a function the cell's deployed workflows still call | A workflow the cell runs calls a function this push removes | Push the workflows without the call first (keep the function), then remove the function |
+| `already; this build` or `another run stored this commit first` | This commit was stored before, from another build of it | Nothing to do: the first package is the commit's. A fixed build time avoids a second build |
 
 ## If the customer revokes your delegation
 No activation of yours starts again, and no package you stored reaches a cell, whoever promotes it. Your pipeline may
