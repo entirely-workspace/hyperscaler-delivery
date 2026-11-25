@@ -144,12 +144,14 @@ secrets, and packages already active in the cell.
 
 ## Take live changes back to git
 Command configuration saved in the Admin Client and hotfolder rules saved on the Hotfolder page change a cell live,
-outside your git. An admin of the cell downloads them with **Export changes** (Settings › Customizations), or you
-download a kept capture in the Solution Console's **Local changes** tab; in your clone, `bin/pull-back.sh` turns that
-file into a branch and a pull request, with your own git credentials:
+outside your git. In your clone, `bin/pull-back.sh` takes the cell's newest capture with your Solution Console sign-in
+(in the browser) and turns it into a branch and a pull request, with your own git credentials. The Solution Console's
+**Local changes** tab shows the command for its cell:
 ```sh
-bash /tmp/censhare-kit/bin/pull-back.sh --from capture-<cell>-<time>.zip [--into <branch>]
+bash /tmp/censhare-kit/bin/pull-back.sh --cell https://<cell>/solution-console/ [--capture] [--into <branch>]
 ```
+A capture downloaded in that tab, or exported by an admin of the cell (**Export changes**, Settings › Customizations),
+goes in with `--from capture-<cell>-<time>.zip` instead.
 The guide says what it does, and what goes where from a test or prod cell.
 
 ## Without the Action

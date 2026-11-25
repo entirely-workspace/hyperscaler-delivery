@@ -56,6 +56,11 @@
 #                   activation, #674 step 3), into the cell's incoming-functions/ for its functions deployer (step 5).
 #                   The images are build output; functions.json must be committed
 #   SCAN_WAIT_SECONDS  the functions activation's wait for an image's scan to be recorded (#1422), 300 by default
+#   RELEASE_WAIT_SECONDS  on test, how long in all a workflows activation waits for the functions of its release
+#                   (#1477, release_gate), 1800 by default; the customer stack sets it, and RELEASE_WAIT_MAX_SECONDS,
+#                   the most a start may ask for within the project's build timeout
+#   FUNCTIONS_PATHS store, functions: what they are built from, as git pathspecs (#1477); everything but workflows/ by
+#                   default. The last commit that changed them is what the commit's workflows wait for on test
 #   STORE_POINTER   no: store without the commit's version pointer (a delivery to the extra dev cells, #1189)
 #   STAGE           the stage this run publishes for, or the cell's id for an extra dev cell (#1189); names the answer
 #                   kept in the store
@@ -312,6 +317,135 @@ prod_gate() {
   echo "accepted by test and approved for prod by $APPROVER"
 }
 
+# release_gate (#1477): a release is one commit of one vendor/package (an automations repository's functions.json and
+# workflows.json name the same one). On test its workflows wait for the functions they call, and only for functions
+# that changed: the commit's functions pointer (versions/_functions/<package>/<commit>.json) names the last commit that
+# changed them (changedAt, written by store). The workflows go on once test has taken the functions of that commit, or
+# of this one (the same code); a promotion may start both at once, so this run waits, at most RELEASE_WAIT_SECONDS of
+# elapsed time (one deadline: the customer stack sets the project's timeout above it, #1488 review). An answer written
+# after this build was started (the request, queue included), or that arrives while waiting, and is no acceptance
+# refuses the workflows with its reason; one written before and that does not change is an earlier activation's, and is
+# waited past. A customization never waits (it is another
+# repository's), and dev is not gated: a delivery stores and activates the functions before the workflows itself.
+release_gate() {
+  local limit=${RELEASE_WAIT_SECONDS:-1800} poll=${RELEASE_POLL_SECONDS:-15} changed digest c i status deadline said started
+  local commits=() digests=() keys=() wants=() first=() now=() statuses=() last
+  [ "$TYPE" = workflows ] || return 0
+  [[ "$limit" =~ ^[0-9]{1,5}$ ]] && [[ "$poll" =~ ^[1-9][0-9]{0,2}$ ]] || fail "RELEASE_WAIT_SECONDS and RELEASE_POLL_SECONDS are seconds"
+  # Never past what the customer stack gave this project (RELEASE_WAIT_MAX_SECONDS, below its build timeout): a start
+  # that asks for more would be stopped by CodeBuild, with no refusal kept (#1488 review).
+  if [[ "${RELEASE_WAIT_MAX_SECONDS:-}" =~ ^[0-9]{1,5}$ ]] && [ "$limit" -gt "$RELEASE_WAIT_MAX_SECONDS" ]; then
+    echo "${W}RELEASE_WAIT_SECONDS $limit is more than this project allows: waiting at most $RELEASE_WAIT_MAX_SECONDS"
+    limit=$RELEASE_WAIT_MAX_SECONDS
+  fi
+  deadline=$((SECONDS + limit))
+  # When this build was started: CodeBuild's start is the request, so a build queued behind another still counts an
+  # answer the functions activation of the same promotion wrote meanwhile as this one's (#1488 review). Outside
+  # CodeBuild, now.
+  started=$(date +%s); [[ "${CODEBUILD_START_TIME:-}" =~ ^[0-9]{10,16}$ ]] && started=$((CODEBUILD_START_TIME / 1000))
+  release_pointer "$STORE_COMMIT" || return 0   # no functions stored with this commit: nothing to wait for
+  read -r digest changed <<< "$REPLY"
+  [[ "$changed" =~ $COMMIT_RE ]] || changed=$STORE_COMMIT   # a pointer from before #1477: its own commit
+  commits=("$STORE_COMMIT"); digests=("$digest")
+  if [ "$changed" != "$STORE_COMMIT" ] && release_pointer "$changed"; then
+    read -r digest _ <<< "$REPLY"; commits+=("$changed"); digests+=("$digest")
+  fi
+  for i in "${!commits[@]}"; do
+    keys[i]="$STORE_VENDOR/packages/${digests[i]#sha256:}/$STAGE-result.json"
+    # The answer there before anything else is read: it is an earlier activation's (#1488 review). A read that fails
+    # (throttling, the network) is tried again, then refuses: an empty one would make an old refusal look new.
+    first_answer "${keys[i]}"; first[i]=$REPLY
+    # Written after this build was started (S3 keeps whole seconds; an answer takes the cell's round trip, so never the
+    # same second): this promotion's functions activation answered already.
+    if [ -n "${first[i]}" ] && [ "$(jq -r '._writtenAt // 0' <<< "${first[i]}")" -gt "$started" ]; then
+      first[i]=""
+    fi
+    # Test's answer names the commit in that digest's own manifest: functions an earlier commit stored first with the
+    # same digest keep that commit, and are these all the same (#1488 review).
+    package_commit "${digests[i]}"; wants[i]=$REPLY
+  done
+  said=
+  while :; do
+    for i in "${!commits[@]}"; do
+      now[i]=$(stage_answer "${keys[i]}"); status=""; [ -n "${now[i]}" ] && status=$(jq -r '.status // empty' <<< "${now[i]}"); statuses[i]=$status
+      if { [ "$status" = published ] || [ "$status" = activated ]; } && [ "$(jq -r '.version // empty' <<< "${now[i]}")" = "${wants[i]}" ]; then
+        echo "$STAGE has taken the functions of ${commits[i]} (${digests[i]}), the last change to them as of $STORE_COMMIT"; return 0
+      fi
+    done
+    for i in "${!commits[@]}"; do
+      if [ -n "${now[i]}" ] && [ "${now[i]}" != "${first[i]}" ]; then
+        # An acceptance for another commit than the manifest's is no refusal: said as it is (#1488 review).
+        case "${statuses[i]}" in published|activated)
+          fail "$STAGE answered for the functions of ${commits[i]} (${digests[i]}) with commit $(jq -r '.version // "none"' <<< "${now[i]}"), not ${wants[i]}, the commit in that package's manifest. The workflows of $STORE_COMMIT are not sent" ;;
+        esac
+        fail "$STAGE refused the functions of ${commits[i]} (${digests[i]}): $(jq -r '.reason // .error // .status // "no reason given"' <<< "${now[i]}"). The workflows of $STORE_COMMIT, which call them, are not sent"
+      fi
+    done
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      c=${commits[*]}; c=${c// / or of }; last=""
+      # Each commit's own last answer, named by commit (#1488 review): one may have an answer while the other has none.
+      for i in "${!commits[@]}"; do [ -z "${statuses[i]}" ] || last+="${last:+, }${commits[i]}: ${statuses[i]}"; done
+      fail "$STAGE has not taken the functions of $c within $limit seconds (they last changed in $changed${last:+; last answers: $last}): promote them first, or the whole release, and look at the functions activation's build on $STAGE (one that stopped before sending keeps no answer). Nothing was sent"
+    fi
+    [ -n "$said" ] || { echo "waiting for $STAGE to take the functions of ${commits[*]} first (they last changed in $changed), at most $((deadline - SECONDS)) more seconds"; said=1; }
+    sleep "$poll"
+  done
+}
+# release_pointer <commit>: REPLY is "<digest> <changedAt>" of the functions that commit stored; 1 when it stored none.
+# Listed first: S3 answers a read of a missing key with 404 only to a role that may list the whole bucket, and this role
+# lists its vendor's versions/ alone (a read carries no s3:prefix), so a commit without functions would read as denied
+# (#1488 review). A listing with the pointer as its prefix is within that grant.
+release_pointer() {
+  local key="$STORE_VENDOR/versions/_functions/$PACKAGE/$1.json" err
+  err=$(aws s3api list-objects-v2 --bucket "$PACKAGES_BUCKET" --prefix "$key" --query 'Contents[].Key' --output text 2>&1) \
+    || fail "whether $1 stored functions could not be read ($key): $err"
+  tr '\t' '\n' <<< "$err" | grep -Fxq -- "$key" || return 1
+  if ! err=$(aws s3api get-object --bucket "$PACKAGES_BUCKET" --key "$key" .release-pointer.json 2>&1 >/dev/null); then
+    rm -f .release-pointer.json; fail "whether $1 stored functions could not be read ($key): $err"
+  fi
+  REPLY=$(jq -r '"\(.digest // "") \(.changedAt // "")"' .release-pointer.json 2>/dev/null); rm -f .release-pointer.json
+  [[ "${REPLY%% *}" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "the pointer $key names no digest"
+}
+# package_commit <digest>: REPLY is the commit in a stored package's manifest (not in a subshell, so a failure stops the run). A stored package always has its manifest, so any
+# error reading it is said as it is.
+package_commit() {
+  local err want
+  if ! err=$(aws s3api get-object --bucket "$PACKAGES_BUCKET" --key "$STORE_VENDOR/packages/${1#sha256:}/manifest.json" \
+      .release-manifest.json 2>&1 >/dev/null); then
+    rm -f .release-manifest.json; fail "the manifest of the functions package $1 could not be read: $err"
+  fi
+  want=$(jq -r '.commit // empty' .release-manifest.json 2>/dev/null); rm -f .release-manifest.json
+  [[ "$want" =~ $COMMIT_RE ]] || fail "the manifest of the functions package $1 has no full commit"
+  REPLY=$want
+}
+# stage_answer <key>: a stage's kept answer in the store, compact, with _writtenAt (when S3 wrote it, epoch seconds; 0
+# when the CLI does not say), or nothing when there is none yet. This role reads a missing key as AccessDenied (it may
+# not list packages/), so that and a 404 are "none yet": the same GetObject grant on packages/* has just read the
+# package's manifest (package_commit), so a denial here is a missing answer, not a missing grant (#1488 review). Any
+# other error (throttling, the network, the key) is said in the log and returns 2 with nothing, which a poll reads as
+# none yet, so a passing one does not end the wait, and the read before the wait does not take as no answer
+# (first_answer, #1488 review).
+stage_answer() {
+  local f m err at; f=$(mktemp); m=$(mktemp)
+  if err=$(aws s3api get-object --bucket "$PACKAGES_BUCKET" --key "$1" "$f" 2>&1 >"$m"); then
+    at=$(jq -r 'try (.LastModified | sub("\\+00:00$"; "Z") | fromdateiso8601) catch 0' "$m" 2>/dev/null)
+    jq -c --argjson at "${at:-0}" '. + {_writtenAt: $at}' "$f" 2>/dev/null
+  else
+    case "$err" in *NoSuchKey*|*AccessDenied*|*"(404)"*|*"Not Found"*) ;; *) echo "${W}$1 could not be read: $(head -1 <<< "$err")" >&2; rm -f "$f" "$m"; return 2 ;; esac
+  fi
+  rm -f "$f" "$m"
+}
+# first_answer <key>: REPLY is the answer there before the wait, as stage_answer reads it; a read that keeps failing
+# refuses the run (not in a subshell, so the failure stops it).
+first_answer() {
+  local n
+  for n in 1 2 3; do
+    REPLY=$(stage_answer "$1") && return 0
+    [ "$n" = 3 ] || sleep "${RELEASE_POLL_SECONDS:-15}"
+  done
+  fail "$STAGE's answer $1 could not be read (above): nothing was sent"
+}
+
 # ---- the package and the request, checked before anything is sent
 # Its type (#762): which file the folder has. customization.json is a customization (censhare-custom), the package this
 # script publishes to a cell; workflows/workflows.json is an automations repository's workflows, which are stored
@@ -422,6 +556,8 @@ elif [ -n "${FROM_STORE:-}" ] && [ "$MODE" = run ]; then
   fi
   [ "${STAGE:-}" = test ] && test_gate
   [ "${STAGE:-}" = prod ] && prod_gate
+  # The release's order on test (#1477); prod comes with its activations of functions and workflows (#1478).
+  [ "${STAGE:-}" = test ] && release_gate
   # After the gates: a start they refuse waits for no scan.
   [ "$TYPE" = functions ] && image_scans
 else
@@ -482,7 +618,8 @@ else
     '{action: "publish", activate: $a} + (if $r == "" then {} else {reason: $r} end)')
   WHAT="publish $VENDOR/$PACKAGE @ $ID (${#FILES[@]} files)"
 fi
-echo "$WHAT, activate: $ACTIVATE${REASON:+ ($REASON)}"
+# Workflows and functions go live when the cell deploys them: no next boot, so no activate to say.
+if [ "$TYPE" = censhare-custom ]; then echo "$WHAT, activate: $ACTIVATE${REASON:+ ($REASON)}"; else echo "$WHAT${REASON:+ ($REASON)}"; fi
 [ "$MODE" = check ] && exit 0
 case "$MODE" in run|store) ;; *) fail "usage: publish.sh check|run|store" ;; esac
 [ "$MODE" = store ] || [ -n "${BUCKET:-}" ] || fail "bucket is required"
@@ -494,8 +631,8 @@ BASE="incoming/$VENDOR/$PACKAGE/$ID"
 # A functions package (#674 step 3): the same, into the cell's functions intake.
 [ "$TYPE" = functions ] && BASE="incoming-functions/$VENDOR/$PACKAGE/$ID-$RUN"
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
-# Still before anything is sent (#1095).
-[ "$MODE" = run ] && cell_fields_check
+# Still before anything is sent (#1095). CELL_FIELDS are customization.json's: a workflows or functions package has none.
+[ "$MODE" = run ] && [ "$TYPE" = censhare-custom ] && cell_fields_check
 
 # upload: the <key>\0<file>\0 pairs on stdin, $PARALLEL at a time, each only if the key is not there yet (If-None-Match:
 # *; see __put above). Returns once every upload has ended, and fails if any did. The action's upload.py does it in one
@@ -566,6 +703,22 @@ push_images() {
   DIGEST="sha256:$(sha256 "${FILES[@]}" | sha256 | cut -d' ' -f1)"
 }
 
+# functions_changed_at (#1477): the last commit, up to this one, that changed what the functions are built from:
+# FUNCTIONS_PATHS (git pathspecs, space-separated), by default everything but workflows/ (a change elsewhere, a README
+# say, only makes the workflows wait for functions that test may well have). A shallow clone's oldest commit seems to
+# add every file, so a last change found there is not one: it is this commit then, and the workflows wait, never the
+# other way round (GitHub's checkout fetches one commit unless fetch-depth: 0; GitLab 20 by default).
+functions_changed_at() {
+  local c paths=() shallow
+  if [ -n "${FUNCTIONS_PATHS:-}" ]; then read -ra paths <<< "$FUNCTIONS_PATHS"; else paths=(. ':(exclude)workflows'); fi
+  # --first-parent: a merge that brought the change is the commit delivered and stored, not the branch commit it
+  # merged, which no pointer names (#1488 review).
+  c=$(git log -1 --first-parent --format=%H "$ID" -- "${paths[@]}" 2>/dev/null) || c=""
+  [[ "$c" =~ $COMMIT_RE ]] || { echo "$ID"; return 0; }
+  shallow=$(git rev-parse --git-path shallow 2>/dev/null)
+  if [ -n "$shallow" ] && [ -f "$shallow" ] && grep -qx "$c" "$shallow"; then echo "$ID"; else echo "$c"; fi
+}
+
 store_package() {
   [ -n "${PACKAGES_BUCKET:-}" ] || fail "PACKAGES_BUCKET is required to store"
   [ -z "$VERSION" ] || fail "store stores a commit, not a version (VERSION)"
@@ -601,7 +754,12 @@ store_package() {
     '{vendor: $v, package: $p, type: $t, commit: $c, digest: $d,
       files: [split("\n")[] | select(length > 0) | capture("^(?<sha256>[0-9a-f]{64})  (?<path>.*)$")]}' > "$TMP/manifest.json"
   # The type in the pointer too: the customer API lists a vendor's customization versions from the pointers alone (#762).
-  jq -n --arg d "$DIGEST" --arg t "$TYPE" '{digest: $d, type: $t}' > "$TMP/version.json"
+  # A functions pointer names the last commit that changed them too (#1477): what the commit's workflows wait for on test.
+  if [ "$TYPE" = functions ]; then
+    jq -n --arg d "$DIGEST" --arg t "$TYPE" --arg c "${CHANGED_AT:-$ID}" '{digest: $d, type: $t, changedAt: $c}' > "$TMP/version.json"
+  else
+    jq -n --arg d "$DIGEST" --arg t "$TYPE" '{digest: $d, type: $t}' > "$TMP/version.json"
+  fi
   # Who stored it, before the manifest: a revoked delegation's packages reach no cell (decision 0023). The role this runs
   # as; the store lets a publisher role write only its own name, and only records dated no later than the manifest count.
   # Not recorded (not a role, or a store that does not allow it yet): the package's publisher is unknown, which is refused
@@ -673,7 +831,8 @@ release() {
     || { echo "${W}prod runs $DIGEST, but current.json could not be written" >&2; return 0; }
   echo "prod release: $DIGEST${previous:+, replaces $previous}"
 }
-if [ "$MODE" = store ]; then [ "$TYPE" = functions ] && push_images; store_package; exit 0; fi
+# The last change to the functions is read in the checkout, before push_images moves into its staging folder.
+if [ "$MODE" = store ]; then [ "$TYPE" = functions ] && { CHANGED_AT=$(functions_changed_at); push_images; }; store_package; exit 0; fi
 
 # The cell's answer in BASE, once it has given one.
 answer() {

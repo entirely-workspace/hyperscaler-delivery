@@ -1,5 +1,5 @@
 name: Deliver to censhare
-# censhare HyperScaler partner kit v2026.11.23-daa83428. Each push to a delegated branch stores this commit's package once, by
+# censhare HyperScaler partner kit v2026.11.25-a20597e0. Each push to a delegated branch stores this commit's package once, by
 # digest, in the customer's package store and activates it in that branch's stage: main → dev, test → test (only if
 # the customer delegated test to you). Prod is never delivered by a pipeline: the customer approves the package test ran.
 on:
@@ -20,7 +20,11 @@ jobs:
     if: github.ref_name == 'main' || github.ref_name == 'test'
     runs-on: ubuntu-latest
     steps:
+      # With the history: the store records the last commit that changed your functions, so a workflows-only change
+      # on test does not wait for functions nobody promotes (#1477). A shallow clone works too; its workflows then wait.
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       # The branch's role must be set: otherwise AWS only says "not authorized" (and test would try main's role).
       - name: Check the publisher role variable
         env:
@@ -31,7 +35,7 @@ jobs:
           [ -n "${!ROLE_VAR}" ] && exit 0
           echo "::error::Set the repository variable $ROLE_VAR to the publisher role the customer gave you for $GITHUB_REF_NAME (Settings → Secrets and variables → Actions → Variables)."
           exit 1
-      - uses: entirely-workspace/hyperscaler-delivery@v2026.11.23-daa83428
+      - uses: entirely-workspace/hyperscaler-delivery@v2026.11.25-a20597e0
         with:
           customer: ${{ vars.CENSHARE_CUSTOMER }}
           packages-bucket: ${{ vars.CENSHARE_PACKAGES_BUCKET }}

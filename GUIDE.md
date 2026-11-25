@@ -80,8 +80,19 @@ Until then, mirror the repository to gitlab.com or GitHub, or use CodeCommit.
   (`docker login`, or `docker/login-action`; on GitHub, `GITHUB_TOKEN` with `packages: read` reads GHCR). Your login
   stays in your CI: censhare never sees it and never contacts your registry. A tag is refused: a tag can move, a digest
   cannot. One `functions.json` may mix both kinds.
+  A function workflows call needs no `triggers`: a workflow calls it directly (`lambda:invoke` on
+  `${function:<name>}`, docs/FUNCTIONS-CONTRACT.md §2). To let callers outside the workflows reach it too (censhare,
+  a person, another system), add `"triggers": [{ "type": "http", "path": "/solution/functions/<route>" }]`:
+  it answers at `POST https://<cell>/solution/functions/<route>`, your cell's own address, to a person's or an
+  automation's token, and gets
+  API Gateway's HTTP event (docs/FUNCTIONS-CONTRACT.md, "Over HTTP").
   To remove a function that a deployed workflow calls, remove the calls first, in a push that still has the function,
   then the function in a later push. The functions go first, so a push that drops both is refused.
+  On test, the workflows of a commit wait until test has taken your functions as of the last commit that changed them,
+  so a push that only changes workflows doesn't wait for functions nobody promotes. "Changed" means anything outside
+  `workflows/` by default; set `FUNCTIONS_PATHS` (git paths, for example `functions src`) in your CI to name what the
+  functions are built from. This needs your history: the starter checks out with `fetch-depth: 0`. A shallow clone
+  works too, but then every push's workflows wait for that push's functions.
 - **When it takes effect.** By default, the cell takes the package at its next restart (`next-boot`). `now` restarts
   the customer's server straight away, so it needs a reason, which is kept in the cell's record. Warn the people
   working on that cell before you use it, also on dev and test. Workflows go live as soon as the cell has deployed
@@ -147,7 +158,15 @@ your git shows them. The cell's Settings › Customizations page says whether th
    cell, with no admin needed. The tab also shows the command below, ready to copy. The zip is yours: apply it to your
    package however you like, by hand or with the helper below.
 2. **You pull them back**, optionally with the kit's helper, in a clean clone of the package's repository:
-   `bash /tmp/censhare-kit/bin/pull-back.sh --from capture-<cell>-<time>.zip [--into <branch>]`. It:
+   `bash /tmp/censhare-kit/bin/pull-back.sh --cell https://<cell>/solution-console/ [--capture] [--into <branch>]`,
+   the command the Local changes tab shows. It opens the cell's sign-in in your browser (the Solution Console's, with
+   the same access as the tab), takes the cell's newest capture, and records the download under your name. `--capture`
+   captures the cell first and takes that capture; without it, a newest capture the cell has changed since is refused.
+   That check sees which files changed, not their content: a file edited again after the capture isn't noticed, so use
+   `--capture` when in doubt. Before you sign in it checks with the cell's own sign-in that the address you gave is
+   that cell's (a look-alike address is refused), and it names the API your sign-in goes to. Your sign-in stays in memory
+   for the run and is never written to disk. With a zip you downloaded or exported, use
+   `--from capture-<cell>-<time>.zip` instead. It:
    - starts a branch `pullback/<cell>/<vendor>/<package>/<yyyymmdd-hhmmss>` from the commit the cell runs, so the pull request holds
      only the live changes, and a later change to the same file on your branch is a conflict there, never lost. That
      commit must be on the branch the pull request goes into;
@@ -155,14 +174,19 @@ your git shows them. The cell's Settings › Customizations page says whether th
      into `settings.ingest`. A folder in `owns` is replaced on every cell the package reaches: a file there that the
      package doesn't hold is removed, live edits made on a test or prod cell included. The pull request names each
      folder it adds;
-   - checks the package (`bin/validate.sh`), commits, pushes with your own git credentials, and opens the pull
-     request with `gh` or `glab` when they're installed; elsewhere it names the branch to open one from. If it stops
+   - checks the package (`bin/validate.sh`), commits and pushes with your own git credentials. On CodeCommit it
+     opens the pull request with your AWS credentials (`aws codecommit create-pull-request`, with the region and
+     profile of origin's address). On GitHub or GitLab, hosted or self-hosted, and any other host, the repository is
+     yours to drive: it names the branch and shows how to open the pull request, the web page (on a GitHub or a
+     GitLab) and the `gh pr create … --fill` or `glab mr create … --fill` command, and you open, review and merge it
+     there. If it stops
      on the way, your clone is back where it was, except when the package check fails: then the branch stays checked
      out with the files, uncommitted, for you to fix.
 3. **Merge and deliver** as usual. From then on your package owns those paths, and the cell is in sync again.
 
-Where the pull request goes: from a dev cell, into `--into` (the branch the cell delivers from) or the default branch;
-from a test or prod cell, always into the default branch, by a pull request. `--package` picks the package when the
+Where the pull request goes: from a dev cell, into `--into`, else, with `--cell`, the branch the cell follows (the
+one its deliveries come from, as its Deployments tab shows it), else the default branch. From a test or prod cell, it
+always goes into the default branch, by a pull request. `--package` picks the package when the
 cell runs several, and one capture goes into one package; `--no-push` only commits. censhare never writes to your git.
 Master data (`app/masterdata/`) is never pulled back: a package carries it only with `"touchesMasterdata": true`.
 
@@ -170,6 +194,9 @@ Master data (`app/masterdata/`) is never pulled back: a package carries it only 
 | You see | It means | Do |
 |---|---|---|
 | The check fails with reasons (for example `owns nothing`) | The cell would refuse the package | Fix what it says. Nothing was stored. |
+| `no longer says what differs` (pull-back) | The cell changed after its newest capture | Run it again with `--capture`, or capture in the Local changes tab first |
+| `is not a cell of the sign-in it names` (pull-back) | The address isn't one the cell's sign-in knows: a mistyped or look-alike address | Use the address the Local changes tab copies |
+| `has no solution-console/cli.json` (pull-back) | The address is not a cell's Solution Console, or its console is older than `--cell` | Check the address the Local changes tab shows; until then, download the capture there and use `--from` |
 | `Not authorized to perform sts:AssumeRoleWithWebIdentity` | This repository, branch or role isn't the delegated one | Check that the branch is the delegated one and the role variable is that branch's role |
 | `Set the CI/CD variable` (GitLab) or `Set the repository variable` (GitHub), naming `CENSHARE_PUBLISHER_ROLE`, or `CENSHARE_PUBLISHER_ROLE_TEST` on `test` | That branch's role variable is missing, or empty on this branch | Set it. On GitLab, check that it isn't protected. |
 | `dev has not accepted` | A promotion to test of a package dev never accepted | Deliver that commit to dev first |
@@ -191,7 +218,6 @@ Master data (`app/masterdata/`) is never pulled back: a package carries it only 
 | The cell refused the functions, naming critical findings in ECR's scan | ECR's scan found a critical vulnerability in the image | Update the base image or the package it names, and push again |
 | The cell refused the functions: ECR's scan of an image ended other than complete (such as UNSUPPORTED_IMAGE or FAILED) | ECR couldn't scan the image, for example one with no package list ECR knows, such as a `scratch` or distroless base | Build it on a base image ECR can scan, such as an AWS Lambda base image |
 | The activation failed: `has not ended; activate again in a few minutes` | ECR's scan of the image hadn't ended within 5 minutes, or never will for a base ECR can't scan | Activate again in a few minutes; if it keeps failing, build on an AWS Lambda base image |
-| The cell refuses a function with an HTTP trigger | Only functions that workflows call are deployed for now | Remove `triggers` |
 | The cell refuses functions.json: it leaves out a function the cell's deployed workflows still call | A workflow the cell runs calls a function this push removes | Push the workflows without the call first (keep the function), then remove the function |
 | `already; this build` or `another run stored this commit first` | This commit was stored before, from another build of it | Nothing to do: the first package is the commit's. A fixed build time avoids a second build |
 

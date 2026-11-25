@@ -1,21 +1,28 @@
 #!/usr/bin/env bash
-# Take a cell's live changes back to git (#1207): a capture (docs/CELL-CAPTURE.md, #1206), downloaded with Export on
-# the Admin Client's Customizations page, becomes a branch from the commit the cell runs and a pull request. Run in
+# Take a cell's live changes back to git (#1207): a capture (docs/CELL-CAPTURE.md, #1206), taken from the cell with your
+# Solution Console sign-in (--cell, #1421) or downloaded (the Local changes tab, or Export on the Admin Client's
+# Customizations page), becomes a branch from the commit the cell runs and a pull request. Run in
 # your clone of the package's repository. It pushes with your own git credentials; censhare holds none (decision 0028).
 # In the partner kit it is bin/pull-back.sh, next to bin/validate.sh.
 #
+#   pull-back.sh --cell <console address> [--capture] [--package <vendor>/<package>] [--into <branch>] [--no-push]
 #   pull-back.sh --from <capture zip> [--package <vendor>/<package>] [--into <branch>] [--no-push]
 #
+#   --cell      the cell's Solution Console, as the Local changes tab shows it (https://<cell>/solution-console/): signs
+#               you in in the browser and takes the cell's newest capture (cell-capture.py, next to this script)
+#   --capture   with --cell: capture the cell first, as Capture now in the tab
 #   --package   which package the changes go into, when the cell runs more than one
-#   --into      the branch the pull request goes into; a capture from a dev cell only (default: origin's default
-#               branch). One from a test or prod cell always goes into the default branch: never a push to it.
+#   --into      the branch the pull request goes into; a capture from a dev cell only (default: with --cell, the
+#               branch the cell follows, else origin's default branch). One from a test or prod cell always goes into
+#               the default branch: never a push to it.
 #   --no-push   commit on the branch in this clone, push nothing
 #
 # What it does: checks the capture (format 1, each file what capture.json says, every path one a package may own),
 # checks out the package's commit the cell runs as pullback/<cell>/<vendor>/<package>/<yyyymmdd-hhmmss>, copies each file into the package's
 # source folder byte for byte, adds each file's folder to "owns", writes the hotfolder rules into settings.ingest,
-# checks the package (validate.sh), commits, pushes, and opens the pull request with gh (GitHub) or glab (GitLab) when
-# present; elsewhere it names the branch. The branch starts from the running commit, so the pull request holds only
+# checks the package (validate.sh), commits and pushes with your own credentials. On CodeCommit it opens the pull
+# request with the AWS CLI; on GitHub and GitLab (hosted or self-hosted) and any other host it names the branch and
+# shows how to open the pull request (the web page, the gh or glab command), which you open and merge yourself. The branch starts from the running commit, so the pull request holds only
 # the live changes, and a later change to the same file on the base is a conflict there, never lost.
 #
 # One capture goes into one package: on a cell that runs several, --package names it, and a second pull-back of the
@@ -29,11 +36,13 @@ set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 fail()   { echo "error: $*" >&2; exit 2; }
 refuse() { echo "refused: $*" >&2; exit 1; }
-usage()  { sed -n '7,13p' "$0" | sed 's/^# \{0,1\}//'; }
-FROM="" PKG="" INTO="" PUSH=1
+usage()  { sed -n '8,18p' "$0" | sed 's/^# \{0,1\}//'; }
+FROM="" CELL="" CAPTURE=0 PKG="" INTO="" PUSH=1
 while [ $# -gt 0 ]; do
   case $1 in
     --from) FROM=${2:-}; shift 2 || fail "--from needs a file" ;;
+    --cell) CELL=${2:-}; shift 2 || fail "--cell needs the cell's Solution Console address" ;;
+    --capture) CAPTURE=1; shift ;;
     --package) PKG=${2:-}; shift 2 || fail "--package needs <vendor>/<package>" ;;
     --into) INTO=${2:-}; shift 2 || fail "--into needs a branch" ;;
     --no-push) PUSH=0; shift ;;
@@ -41,13 +50,16 @@ while [ $# -gt 0 ]; do
     *) usage >&2; fail "unknown option $1" ;;
   esac
 done
-[ -n "$FROM" ] || { usage >&2; fail "usage: --from <capture zip> is needed"; }
-[ -f "$FROM" ] || fail "no such capture: $FROM"
+[ -n "$FROM" ] || [ -n "$CELL" ] || { usage >&2; fail "usage: --cell <console address> or --from <capture zip> is needed"; }
+[ -z "$FROM" ] || [ -z "$CELL" ] || { usage >&2; fail "usage: --cell or --from, not both"; }
+[ "$CAPTURE" = 0 ] || [ -n "$CELL" ] || { usage >&2; fail "usage: --capture goes with --cell"; }
+[ -n "$CELL" ] || [ -f "$FROM" ] || fail "no such capture: $FROM"
 for t in git jq python3; do command -v "$t" >/dev/null || fail "$t is needed"; done
+[ -z "$CELL" ] || [ -f "$HERE/cell-capture.py" ] || fail "cell-capture.py is not next to $0"
 # The kit ships the validator next to this script; this repository keeps it in scripts/.
 for V in "$HERE/validate-customization.py" "$HERE/../validate-customization.py"; do [ -f "$V" ] && break; done
 [ -f "$V" ] || fail "validate-customization.py is not next to $0"
-FROM=$(cd "$(dirname "$FROM")" && pwd)/$(basename "$FROM")
+[ -z "$FROM" ] || FROM=$(cd "$(dirname "$FROM")" && pwd)/$(basename "$FROM")
 TOP=$(git rev-parse --show-toplevel 2>/dev/null) || fail "run it in your clone of the package's repository"
 cd "$TOP" || exit 2
 [ -z "$(git status --porcelain)" ] || fail "this clone has uncommitted changes: commit or stash them first"
@@ -64,6 +76,18 @@ cleanup() {
   rm -rf "$W"
 }
 trap cleanup EXIT
+
+# 0. From the cell (#1421): the newest capture, with the developer's own sign-in, into this run's folder. Only once the
+# clone is clean, so nobody signs in for a run that cannot go on.
+if [ -n "$CELL" ]; then
+  args=(--cell "$CELL" --out "$W/cell.zip" --follows "$W/follows.json"); [ "$CAPTURE" = 1 ] && args+=(--capture)
+  python3 -I "$HERE/cell-capture.py" "${args[@]}"; rc=$?
+  case $rc in
+    0) FROM="$W/cell.zip" ;;
+    3) exit 0 ;;   # in sync: nothing to pull back (said by cell-capture.py)
+    *) exit "$rc" ;;
+  esac
+fi
 
 # 1. The capture: read and checked in full before anything is touched. -I: nothing in the clone may change what
 # Python imports. own_ok is the validator's, the rule the cell's boot and the publish apply.
@@ -178,7 +202,44 @@ done < <(git ls-tree -r --name-only "$REV" | grep -E '(^|/)customization\.json$'
 DEFAULT=$(git symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null); DEFAULT=${DEFAULT#origin/}
 [ -n "$DEFAULT" ] || DEFAULT=$(git ls-remote --symref origin HEAD 2>/dev/null | sed -n 's#^ref: refs/heads/\([^[:space:]]*\)[[:space:]]*HEAD$#\1#p')
 DEFAULT=${DEFAULT:-main}
-if [ "$stage" = dev ]; then BASE=${INTO:-$DEFAULT}
+# The branch a dev cell follows (#1207 slice 3), when cell-capture.py read it from the customer API: the base unless
+# --into names one. Only when the binding names origin's repository, and origin has that branch with the commit the
+# cell runs on it (a failed delivery from another branch can be the newest report, #1467 review). Anything else is
+# said, and the default branch stays the base, as before: a followed branch never turns a pull-back into a refusal.
+URL=$(git config --get remote.origin.url)
+# A repository's path without its host: https://host/acme/custom.git, git@host:acme/custom and codecommit://p@name give
+# acme/custom, acme/custom and name. A plain name stays as it is.
+repo_path() {
+  local x=${1%/}; x=${x%.git}
+  case $x in
+    *://*) x=${x#*://}; x=${x#*@}; case $x in */*) x=${x#*/} ;; esac ;;
+    *@*:*) x=${x#*:} ;;
+  esac
+  printf '%s' "$x" | tr 'A-Z' 'a-z'
+}
+# Whether the binding names the repository at path $2: the whole path when the binding has an owner (other-org/custom
+# is not acme/custom, #1467 review), else the last segment.
+same_repo() {
+  local b p; b=$(repo_path "$1"); p=$(repo_path "$2")
+  [ -n "$b" ] && [ -n "$p" ] || return 1
+  case $b in */*) [ "$p" = "$b" ] || [ "${p%/"$b"}" != "$p" ] ;; *) [ "${p##*/}" = "$b" ] ;; esac
+}
+FOLLOWS=""
+if [ "$stage" = dev ] && [ -z "$INTO" ] && [ -s "$W/follows.json" ]; then
+  f_err=$(jq -r '.error // ""' "$W/follows.json"); f_repo=$(jq -r '.repository // ""' "$W/follows.json"); f_branch=$(jq -r '.branch // ""' "$W/follows.json")
+  if [ -n "$f_err" ]; then echo "note: which branch $cell follows could not be read ($f_err): into $DEFAULT" >&2
+  elif [ -z "$f_branch" ]; then echo "note: $cell follows no branch yet: into $DEFAULT" >&2
+  elif ! same_repo "$f_repo" "$URL"; then
+    echo "note: $cell follows $f_repo / $f_branch, not this repository: into $DEFAULT (name a branch with --into)" >&2
+  elif ! git fetch -q origin "refs/heads/$f_branch:refs/remotes/origin/$f_branch" 2>/dev/null; then
+    echo "note: $cell follows $f_branch, which origin no longer has: into $DEFAULT (name a branch with --into)" >&2
+  elif ! git merge-base --is-ancestor "$REV" "refs/remotes/origin/$f_branch"; then
+    echo "note: $cell follows $f_branch, which does not hold the commit it runs: into $DEFAULT (name a branch with --into)" >&2
+  else
+    FOLLOWS=$f_branch; echo "into $FOLLOWS, the branch $cell follows"
+  fi
+fi
+if [ "$stage" = dev ]; then BASE=${INTO:-${FOLLOWS:-$DEFAULT}}
 else
   [ -z "$INTO" ] || [ "$INTO" = "$DEFAULT" ] || refuse "a capture from a $stage cell goes into $DEFAULT, by a pull request; not into $INTO"
   BASE=$DEFAULT
@@ -269,15 +330,63 @@ if [ "$PUSH" = 0 ]; then
   echo "not pushed (--no-push): git push -u origin $BR, then open a pull request into $BASE"; exit 0
 fi
 git push -q -u origin "$BR" || refuse "could not push $BR; it is committed in this clone"
-URL=$(git config --get remote.origin.url)
+# The pull request: pull-back opens it itself only on CodeCommit in the customer's account. GitHub and GitLab, hosted or
+# self-hosted, are the customer's own (#1467): pull-back pushes the branch and says how to open the pull request there,
+# with the web page and the CLI command, and runs neither.
+HOST=${URL#*://}; HOST=${HOST#*@}; HOST=${HOST%%/*}; HOST=${HOST%%:*}
 case $URL in
-  *github.com[:/]*) TOOL=gh ;;
-  *gitlab*) TOOL=glab ;;
+  codecommit::*|codecommit://*|*git-codecommit.*.amazonaws.com/v1/repos/*|*git-codecommit-fips.*.amazonaws.com/v1/repos/*) TOOL=codecommit ;;
+  *git-codecommit.*.amazonaws.com.cn/v1/repos/*) TOOL=codecommit ;;
   *) TOOL="" ;;
 esac
-if [ "$TOOL" = gh ] && command -v gh >/dev/null; then
-  printf '%s\n' "$BODY" | gh pr create --base "$BASE" --head "$BR" --title "$TITLE" --body-file - && exit 0
-elif [ "$TOOL" = glab ] && command -v glab >/dev/null; then
-  glab mr create --source-branch "$BR" --target-branch "$BASE" --title "$TITLE" --description "$BODY" --yes && exit 0
+if [ "$TOOL" = codecommit ] && command -v aws >/dev/null; then
+  # The repository in the customer's own account, with the developer's AWS credentials (decision 0028: never censhare's).
+  # https://git-codecommit.<region>.amazonaws.com/v1/repos/<name>, ssh://…, or git-remote-codecommit's
+  # codecommit::<region>://[<profile>@]<name> and codecommit://[<profile>@]<name>.
+  CC_REGION="" CC_PROFILE="" CC_NAME=""
+  case $URL in
+    codecommit:*)
+      rest=${URL#codecommit:}; rest=${rest#:}
+      case $rest in *://*) CC_REGION=${rest%%://*}; rest=${rest#*://} ;; *) rest=${rest#//} ;; esac
+      case $rest in *@*) CC_PROFILE=${rest%%@*}; CC_NAME=${rest#*@} ;; *) CC_NAME=$rest ;; esac ;;
+    *) CC_REGION=${HOST#git-codecommit.}; CC_REGION=${CC_REGION#git-codecommit-fips.}; CC_REGION=${CC_REGION%.cn}; CC_REGION=${CC_REGION%.amazonaws.com}
+       CC_NAME=${URL##*/v1/repos/}; CC_NAME=${CC_NAME%/} ;;
+  esac
+  # No region in the address: where git-remote-codecommit pushed (botocore: AWS_DEFAULT_REGION, then the profile's),
+  # AWS_REGION only last (#1467 review).
+  if [ -z "$CC_REGION" ]; then
+    CC_REGION=${AWS_DEFAULT_REGION:-}
+    [ -n "$CC_REGION" ] || CC_REGION=$(aws configure get region ${CC_PROFILE:+--profile "$CC_PROFILE"} 2>/dev/null)
+    [ -n "$CC_REGION" ] || CC_REGION=${AWS_REGION:-}
+  fi
+  if [[ "$CC_REGION" =~ ^[a-z]{2}(-[a-z]+)+-[0-9]$ ]] && [[ "$CC_NAME" =~ ^[A-Za-z0-9._-]{1,100}$ ]]; then
+    TARGETS=$(jq -cn --arg r "$CC_NAME" --arg s "$BR" --arg d "$BASE" '[{repositoryName: $r, sourceReference: $s, destinationReference: $d}]')
+    # CodeCommit takes a description of at most 10,240 characters.
+    ID=$(aws codecommit create-pull-request --region "$CC_REGION" ${CC_PROFILE:+--profile "$CC_PROFILE"} --title "$TITLE" \
+      --description "${BODY:0:10000}" --targets "$TARGETS" --query pullRequest.pullRequestId --output text) && [[ "$ID" =~ ^[0-9]+$ ]] && {
+      case $CC_REGION in   # the console of the region's partition
+        cn-*) CONSOLE=https://console.amazonaws.cn ;;
+        us-gov-*) CONSOLE=https://console.amazonaws-us-gov.com ;;
+        *) CONSOLE=https://$CC_REGION.console.aws.amazon.com ;;
+      esac
+      echo "$CONSOLE/codesuite/codecommit/repositories/$CC_NAME/pull-requests/$ID/details?region=$CC_REGION"
+      exit 0; }
+  else
+    echo "note: origin is CodeCommit, but its region or repository could not be told from $URL (set AWS_REGION)" >&2
+  fi
 fi
-echo "pushed $BR: open a pull request from $BR into $BASE"
+echo "pushed $BR: open a pull request from $BR into $BASE in your repository, then review and merge it there"
+# How, for the host origin names: its page when it is a GitHub or a GitLab by name, and both CLIs' commands, which take
+# the title and the description from the commit (--fill). Suggestions only: nothing here is run.
+WEB=${URL%/}; WEB=${WEB%.git}
+case $WEB in *://*) WEB=${WEB#*://}; WEB=${WEB#*@}; WEB=${WEB#*/} ;; *@*:*) WEB=${WEB#*:} ;; *) WEB="" ;; esac
+if [ "$TOOL" != codecommit ] && [ -n "$HOST" ] && [ -n "$WEB" ]; then
+  case $HOST in
+    *github*) echo "  in the browser: https://$HOST/$WEB/compare/$BASE...$BR?expand=1" ;;
+    *gitlab*) echo "  in the browser: https://$HOST/$WEB/-/merge_requests/new?merge_request%5Bsource_branch%5D=$BR&merge_request%5Btarget_branch%5D=$BASE" ;;
+  esac
+fi
+if [ "$TOOL" != codecommit ]; then
+  echo "  with GitHub's CLI: gh pr create --base $BASE --head $BR --fill"
+  echo "  with GitLab's CLI: glab mr create --source-branch $BR --target-branch $BASE --fill"
+fi

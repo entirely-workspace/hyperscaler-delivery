@@ -2,7 +2,7 @@
 
 This repository is yours: it holds your censhare customization package and delivers it, from your own CI, to the
 censhare HyperScaler cells of the customer you work for. censhare keeps no copy of your source. Copied from the
-`starter/` folder of the censhare partner kit v2026.11.23-daa83428.
+`starter/` folder of the censhare partner kit v2026.11.25-a20597e0.
 
 ## Make it yours
 1. In `customization.json`, set `vendor` to the vendor id censhare gave you and `package` to your package's name.

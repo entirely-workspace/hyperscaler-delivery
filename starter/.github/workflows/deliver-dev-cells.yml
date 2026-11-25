@@ -1,5 +1,5 @@
 name: Deliver to the extra dev cells
-# censhare HyperScaler partner kit v2026.11.23-daa83428. Each push to any branch goes to the customer's extra dev cells that
+# censhare HyperScaler partner kit v2026.11.25-a20597e0. Each push to any branch goes to the customer's extra dev cells that
 # follow this repository and that branch (each cell's Solution Console, Deployments tab), at once. A push no cell follows
 # ends green with nothing delivered. Never a stage: main and test go through deliver.yml.
 on:
@@ -20,7 +20,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
-      - uses: entirely-workspace/hyperscaler-delivery@v2026.11.23-daa83428
+      - uses: entirely-workspace/hyperscaler-delivery@v2026.11.25-a20597e0
         with:
           customer: ${{ vars.CENSHARE_CUSTOMER }}
           packages-bucket: ${{ vars.CENSHARE_PACKAGES_BUCKET }}
