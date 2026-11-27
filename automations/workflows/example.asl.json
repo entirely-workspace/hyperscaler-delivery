@@ -1,0 +1,28 @@
+{
+  "Comment": "A placeholder workflow: it calls the example function, trying again when it is busy (it runs one at a time), and ends. Replace it with your own (Workflow Studio export).",
+  "StartAt": "Say hello",
+  "States": {
+    "Say hello": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${function:hello}",
+        "Payload": {
+          "name": "censhare"
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.TooManyRequestsException", "Lambda.ServiceException", "Lambda.SdkClientException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "ResultSelector": {
+        "greeting.$": "$.Payload.greeting"
+      },
+      "End": true
+    }
+  }
+}

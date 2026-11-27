@@ -22,6 +22,7 @@
 #   <vendor>/versions/_functions/<package>/<commit>.json  a functions commit's (#674), apart for the same reason
 #   <vendor>/packages/<hex>/prod-approval.json            the customer's approval for prod (#781), written once
 #   <vendor>/prod/<package>/current.json, history/...     prod's release: what runs, and every promotion
+#   <vendor>/prod/_<type>/<package>/current.json, history/...  a workflows or functions package's prod release (#1478)
 # A run with FROM_STORE=<digest> (and STORE_VENDOR) publishes a stored package instead of a checkout: from an empty
 # folder, every file checked against the manifest and the digest recomputed before anything is sent.
 #
@@ -60,7 +61,17 @@
 #                   (#1477, release_gate), 1800 by default; the customer stack sets it, and RELEASE_WAIT_MAX_SECONDS,
 #                   the most a start may ask for within the project's build timeout
 #   FUNCTIONS_PATHS store, functions: what they are built from, as git pathspecs (#1477); everything but workflows/ by
-#                   default. The last commit that changed them is what the commit's workflows wait for on test
+#                   default. The last commit that changed them is what the commit's workflows wait for on test, and,
+#                   since #1546, a commit with no change there stores no functions package: it points at that last
+#                   change's. Too narrow a value (functions/ while shared code lives in lib/) keeps the old image running
+#   FROM_COMMIT     run, workflows on test: the commit whose row was promoted, which must have stored FROM_STORE
+#                   (#1546). The release gate waits for its functions; without it, the package manifest's commit
+#   SWITCH          run, workflows (#1559) or functions (#1560): <name>:<version>:pin|unpin, one workflow's or function's live alias moved to a version
+#                   the stage published before (pin), or back to its package's (unpin). The customer API alone sets it
+#                   (activation-gate.sh). Only a switch request is sent, no package files, and no gate runs: the API
+#                   checked the version. Its answer (switched) is not kept as the stage's deploy answer. Every other
+#                   workflows or functions run carries the stage's pins of its type (<vendor>/pins/<stage>/<type>/), so a
+#                   deploy keeps a pinned one where it was switched to; pins that cannot be read send nothing
 #   STORE_POINTER   no: store without the commit's version pointer (a delivery to the extra dev cells, #1189)
 #   STAGE           the stage this run publishes for, or the cell's id for an extra dev cell (#1189); names the answer
 #                   kept in the store
@@ -200,6 +211,9 @@ from_store() {
   [ "sha256:$(sha256 "${FILES[@]}" | sha256 | cut -d' ' -f1)" = "$FROM_STORE" ] || fail "the stored files do not make the digest $FROM_STORE"
   echo "fetched $FROM_STORE ($n files, commit $STORE_COMMIT) from the store"
 }
+# A switch (#1559) is a workflows activation's alone: refused before anything is fetched.
+case "${SWITCH:+set}:${PACKAGE_TYPE:-}" in set:workflows|set:functions|:*) ;;
+  *) fail "a switch moves one workflow's or function's live alias: only a workflows or functions activation takes SWITCH (#1559, #1560)" ;; esac
 [ -n "${FROM_STORE:-}" ] && [ "$MODE" = run ] && from_store
 
 # cell_reachable: an activation signs in to its stage's cell as the cell's publish role before anything is sent. A cell
@@ -325,11 +339,13 @@ prod_gate() {
 # elapsed time (one deadline: the customer stack sets the project's timeout above it, #1488 review). An answer written
 # after this build was started (the request, queue included), or that arrives while waiting, and is no acceptance
 # refuses the workflows with its reason; one written before and that does not change is an earlier activation's, and is
-# waited past. A customization never waits (it is another
+# waited past. An acceptance counts only while those functions are what test runs (#1505 review): no other functions of
+# the package stored before them were accepted after it (went_back), since test rolls functions back by promoting
+# older ones and their earlier answer stays; newer ones are a release ahead, which the workflows may run on. A customization never waits (it is another
 # repository's), and dev is not gated: a delivery stores and activates the functions before the workflows itself.
 release_gate() {
   local limit=${RELEASE_WAIT_SECONDS:-1800} poll=${RELEASE_POLL_SECONDS:-15} changed digest c i status deadline said started
-  local commits=() digests=() keys=() wants=() first=() now=() statuses=() last
+  local commits=() digests=() keys=() wants=() first=() now=() statuses=() went=() last
   [ "$TYPE" = workflows ] || return 0
   [[ "$limit" =~ ^[0-9]{1,5}$ ]] && [[ "$poll" =~ ^[1-9][0-9]{0,2}$ ]] || fail "RELEASE_WAIT_SECONDS and RELEASE_POLL_SECONDS are seconds"
   # Never past what the customer stack gave this project (RELEASE_WAIT_MAX_SECONDS, below its build timeout): a start
@@ -343,11 +359,21 @@ release_gate() {
   # answer the functions activation of the same promotion wrote meanwhile as this one's (#1488 review). Outside
   # CodeBuild, now.
   started=$(date +%s); [[ "${CODEBUILD_START_TIME:-}" =~ ^[0-9]{10,16}$ ]] && started=$((CODEBUILD_START_TIME / 1000))
-  release_pointer "$STORE_COMMIT" || return 0   # no functions stored with this commit: nothing to wait for
+  # The release is the commit promoted (#1546). Workflows a later commit did not change are the package an earlier commit
+  # stored first, and its manifest names that one; the console then passes the commit of the row promoted, FROM_COMMIT,
+  # which must have stored this very digest. Without it, the manifest's commit, as before.
+  local gate=$STORE_COMMIT
+  if [ -n "${FROM_COMMIT:-}" ]; then
+    [[ "$FROM_COMMIT" =~ $COMMIT_RE ]] || fail "FROM_COMMIT is a full commit, 40 hex digits, not '$FROM_COMMIT'. Nothing was sent"
+    typed_pointer workflows "$FROM_COMMIT" || fail "$FROM_COMMIT stored no workflows of $PACKAGE: promote the version it stored. Nothing was sent"
+    [ "$REPLY" = "$FROM_STORE" ] || fail "$FROM_COMMIT stored the workflows $REPLY, not $FROM_STORE. Nothing was sent"
+    gate=$FROM_COMMIT
+  fi
+  release_pointer "$gate" || return 0   # no functions stored with this commit: nothing to wait for
   read -r digest changed <<< "$REPLY"
-  [[ "$changed" =~ $COMMIT_RE ]] || changed=$STORE_COMMIT   # a pointer from before #1477: its own commit
-  commits=("$STORE_COMMIT"); digests=("$digest")
-  if [ "$changed" != "$STORE_COMMIT" ] && release_pointer "$changed"; then
+  [[ "$changed" =~ $COMMIT_RE ]] || changed=$gate   # a pointer from before #1477: its own commit
+  commits=("$gate"); digests=("$digest")
+  if [ "$changed" != "$gate" ] && release_pointer "$changed"; then
     read -r digest _ <<< "$REPLY"; commits+=("$changed"); digests+=("$digest")
   fi
   for i in "${!commits[@]}"; do
@@ -368,28 +394,76 @@ release_gate() {
   while :; do
     for i in "${!commits[@]}"; do
       now[i]=$(stage_answer "${keys[i]}"); status=""; [ -n "${now[i]}" ] && status=$(jq -r '.status // empty' <<< "${now[i]}"); statuses[i]=$status
+      went[i]=""
       if { [ "$status" = published ] || [ "$status" = activated ]; } && [ "$(jq -r '.version // empty' <<< "${now[i]}")" = "${wants[i]}" ]; then
-        echo "$STAGE has taken the functions of ${commits[i]} (${digests[i]}), the last change to them as of $STORE_COMMIT"; return 0
+        if went_back "$(jq -r '._writtenAt // 0' <<< "${now[i]}")" "${digests[@]}"; then went[i]=$REPLY; continue; fi
+        echo "$STAGE has taken the functions of ${commits[i]} (${digests[i]}), the last change to them as of $gate"; return 0
       fi
     done
     for i in "${!commits[@]}"; do
       if [ -n "${now[i]}" ] && [ "${now[i]}" != "${first[i]}" ]; then
         # An acceptance for another commit than the manifest's is no refusal: said as it is (#1488 review).
         case "${statuses[i]}" in published|activated)
-          fail "$STAGE answered for the functions of ${commits[i]} (${digests[i]}) with commit $(jq -r '.version // "none"' <<< "${now[i]}"), not ${wants[i]}, the commit in that package's manifest. The workflows of $STORE_COMMIT are not sent" ;;
+          fail "$STAGE answered for the functions of ${commits[i]} (${digests[i]}) with commit $(jq -r '.version // "none"' <<< "${now[i]}"), not ${wants[i]}, the commit in that package's manifest. The workflows of $gate are not sent" ;;
         esac
-        fail "$STAGE refused the functions of ${commits[i]} (${digests[i]}): $(jq -r '.reason // .error // .status // "no reason given"' <<< "${now[i]}"). The workflows of $STORE_COMMIT, which call them, are not sent"
+        fail "$STAGE refused the functions of ${commits[i]} (${digests[i]}): $(jq -r '.reason // .error // .status // "no reason given"' <<< "${now[i]}"). The workflows of $gate, which call them, are not sent"
       fi
     done
     if [ "$SECONDS" -ge "$deadline" ]; then
       c=${commits[*]}; c=${c// / or of }; last=""
       # Each commit's own last answer, named by commit (#1488 review): one may have an answer while the other has none.
-      for i in "${!commits[@]}"; do [ -z "${statuses[i]}" ] || last+="${last:+, }${commits[i]}: ${statuses[i]}"; done
+      for i in "${!commits[@]}"; do
+        [ -z "${statuses[i]}" ] || last+="${last:+, }${commits[i]}: ${statuses[i]}${went[i]:+, but $STAGE went back to ${went[i]} since}"
+      done
       fail "$STAGE has not taken the functions of $c within $limit seconds (they last changed in $changed${last:+; last answers: $last}): promote them first, or the whole release, and look at the functions activation's build on $STAGE (one that stopped before sending keeps no answer). Nothing was sent"
     fi
     [ -n "$said" ] || { echo "waiting for $STAGE to take the functions of ${commits[*]} first (they last changed in $changed), at most $((deadline - SECONDS)) more seconds"; said=1; }
     sleep "$poll"
   done
+}
+# went_back <writtenAt> <digest>...: 0 with REPLY the digest when test went back since writtenAt (epoch seconds) to
+# functions of the package stored before the given ones (#1505 review): the newest acceptance of other functions is
+# later than writtenAt, and they were stored first. Functions stored after them are a release ahead, which the workflows
+# may run on, as the customer API's rollback rule has it; 1 otherwise. The package's functions are those its pointers
+# name (listed within the vendor's versions/ grant, as release_pointer); a digest is stored when its first pointer was
+# written: store order, not commit order (a pointer is written once; an older commit stored late counts as ahead). Each
+# pointer is read once per run (it never changes): one that cannot be read refuses, as any read the gate
+# depends on. An answer that cannot be read is said in the log (stage_answer) and counts as going back, so the wait
+# goes on, never past it.
+went_back() {
+  local at=$1 prefix="$STORE_VENDOR/versions/_functions/$PACKAGE/" keys key d t a w best="" bestw=$1 mine="" err; shift
+  : "${POINTER_DIGESTS:=$(mktemp)}"
+  keys=$(aws s3api list-objects-v2 --bucket "$PACKAGES_BUCKET" --prefix "$prefix" --query 'Contents[].Key' --output text 2>&1) \
+    || fail "the functions pointers of $PACKAGE could not be listed ($prefix): $keys"
+  for key in $keys; do
+    [[ "$key" == "$prefix"*.json ]] || continue
+    if ! awk -v k="$key" '$1 == k { f = 1 } END { exit !f }' "$POINTER_DIGESTS"; then
+      if ! err=$(aws s3api get-object --bucket "$PACKAGES_BUCKET" --key "$key" .went-back.json 2>&1 >.went-back.meta); then
+        rm -f .went-back.json .went-back.meta; fail "the functions pointer $key could not be read: $err"
+      fi
+      d=$(jq -r '.digest // ""' .went-back.json 2>/dev/null)
+      t=$(jq -r 'try (.LastModified | sub("\\+00:00$"; "Z") | fromdateiso8601) catch 0' .went-back.meta 2>/dev/null)
+      rm -f .went-back.json .went-back.meta
+      printf '%s %s %s\n' "$key" "${d:--}" "${t:-0}" >> "$POINTER_DIGESTS"
+    fi
+  done
+  # When each digest was stored: its earliest pointer. The given ones' is the earliest of theirs.
+  for d in "$@"; do
+    t=$(awk -v d="$d" '$2 == d { print $3 }' "$POINTER_DIGESTS" | sort -n | head -1)
+    [ -n "$t" ] && { [ -z "$mine" ] || [ "$t" -lt "$mine" ]; } && mine=$t
+  done
+  for d in $(awk '$2 ~ /^sha256:[0-9a-f]{64}$/ { print $2 }' "$POINTER_DIGESTS" | sort -u); do
+    case " $* " in *" $d "*) continue ;; esac
+    a=$(stage_answer "$STORE_VENDOR/packages/${d#sha256:}/$STAGE-result.json") || { REPLY="$d (its answer could not be read)"; return 0; }
+    [ -n "$a" ] || continue
+    case "$(jq -r '.status // empty' <<< "$a")" in published|activated) ;; *) continue ;; esac
+    w=$(jq -r '._writtenAt // 0' <<< "$a")
+    [ "$w" -gt "$bestw" ] && { best=$d; bestw=$w; }
+  done
+  [ -n "$best" ] || return 1
+  t=$(awk -v d="$best" '$2 == d { print $3 }' "$POINTER_DIGESTS" | sort -n | head -1)
+  [ -n "$mine" ] && [ "${t:-0}" -lt "$mine" ] || return 1
+  REPLY=$best
 }
 # release_pointer <commit>: REPLY is "<digest> <changedAt>" of the functions that commit stored; 1 when it stored none.
 # Listed first: S3 answers a read of a missing key with 404 only to a role that may list the whole bucket, and this role
@@ -405,6 +479,19 @@ release_pointer() {
   fi
   REPLY=$(jq -r '"\(.digest // "") \(.changedAt // "")"' .release-pointer.json 2>/dev/null); rm -f .release-pointer.json
   [[ "${REPLY%% *}" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "the pointer $key names no digest"
+}
+# typed_pointer <type> <commit>: REPLY is the digest of the <type> package that commit stored; 1 when it stored none
+# (#1546). Listed before it is read, as release_pointer is.
+typed_pointer() {
+  local key="$STORE_VENDOR/versions/_$1/$PACKAGE/$2.json" err
+  err=$(aws s3api list-objects-v2 --bucket "$PACKAGES_BUCKET" --prefix "$key" --query 'Contents[].Key' --output text 2>&1) \
+    || fail "whether $2 stored $1 could not be read ($key): $err"
+  tr '\t' '\n' <<< "$err" | grep -Fxq -- "$key" || return 1
+  if ! err=$(aws s3api get-object --bucket "$PACKAGES_BUCKET" --key "$key" .typed-pointer.json 2>&1 >/dev/null); then
+    rm -f .typed-pointer.json; fail "whether $2 stored $1 could not be read ($key): $err"
+  fi
+  REPLY=$(jq -r '.digest // ""' .typed-pointer.json 2>/dev/null); rm -f .typed-pointer.json
+  [[ "$REPLY" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "the pointer $key names no digest"
 }
 # package_commit <digest>: REPLY is the commit in a stored package's manifest (not in a subshell, so a failure stops the run). A stored package always has its manifest, so any
 # error reading it is said as it is.
@@ -527,6 +614,43 @@ image_scans() {
   REQUEST=$(jq -c --argjson s "$scans" '. + {scans: $s}' <<< "$REQUEST")
 }
 
+# stage_pins (#1559, #1560): REPLY is this stage's pinned workflows or functions (TYPE), {"<name>": <version>}: of each one's
+# events under <vendor>/pins/<stage>/<type>/<name>/<time>-<request>.json (written once, by the customer API), the newest
+# whose switch went through (review of #1562); a pin counts, an unpin takes it out. A newer one that did not leaves the
+# one before it in place. Fails closed: a deploy without them would move a switched workflow back unasked.
+stage_pins() {
+  local root="$STORE_VENDOR/pins/$STAGE/$TYPE/" keys k pins='{}' names="" f n a s b off="" all
+  f=$(mktemp)
+  keys=$(aws s3api list-objects-v2 --bucket "$PACKAGES_BUCKET" --prefix "$root" --query 'Contents[].Key' --output text 2>&1) \
+    || fail "the pins of $STAGE could not be read ($keys): nothing was sent, since a deploy without them would undo a switch"
+  [ "$keys" = None ] && keys=""
+  all=$(printf '%s\n' "$keys" | tr '\t' '\n')
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    while IFS= read -r k; do
+      aws s3api get-object --bucket "$PACKAGES_BUCKET" --key "$k" "$f" >/dev/null 2>&1 \
+        || fail "the pin $k could not be read: nothing was sent, since a deploy without it would undo a switch"
+      a=$(jq -r 'if (.action == "pin" or .action == "unpin") and (.version | type) == "number" and .version >= 1 then .action else "" end' "$f" 2>/dev/null) || a=""
+      [ -n "$a" ] || continue
+      # Whether its switch went through: one naming itself (switch) or, a pin before that, its build, by its record; one
+      # naming neither is from before switches were recorded, and counts as it did.
+      s=$(jq -r 'if (.switch | type) == "string" then .switch else "" end' "$f" 2>/dev/null) || s=""
+      b=$(jq -r 'if .action == "pin" and (.build | type) == "string" then .build else "" end' "$f" 2>/dev/null) || b=""
+      if [ -n "$s$b" ] && ! { [[ "${s:-$b}" =~ ^[A-Za-z0-9=_-]{1,90}$ ]] && grep -qxF "${root}${n}/switched/${s:-$b}.json" <<< "$all"; }; then
+        if [ "$a" = pin ]; then off="${off:+$off, }$n v$(jq -r .version "$f")"; else off="${off:+$off, }$n unpin"; fi
+        continue
+      fi
+      [ "$a" = pin ] && pins=$(jq -c --arg n "$n" --argjson v "$(jq .version "$f")" '. + {($n): $v}' <<< "$pins")
+      break
+    done < <(grep -E "^${root//\//\\/}${n}/[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{9}Z-[A-Za-z0-9=_-]{1,64}\.json$" <<< "$all" | LC_ALL=C sort -r)
+  done < <(grep -E "^${root//\//\\/}[a-z0-9][a-z0-9_-]*/[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{9}Z-[A-Za-z0-9=_-]{1,64}\.json$" <<< "$all" \
+    | awk -F/ '{ print $(NF-1) }' | LC_ALL=C sort -u)
+  rm -f "$f"
+  names=$(jq -r 'to_entries | map("\(.key) v\(.value)") | join(", ")' <<< "$pins")
+  [ -n "$names" ] && echo "pinned on $STAGE: $names (they stay on those versions)"
+  [ -n "$off" ] && echo "${W}did not go through: $off (its activation did not record the switch), so each keeps the pin before it, if any: switch or unpin again"
+  REPLY=$pins
+}
 if [ -n "$VERSION" ]; then
   [[ "$VERSION" =~ $COMMIT_RE ]] || fail "version must be the full 40-character commit of a version already published (on the commit's page, copy the full SHA), not '$VERSION'"
   ID="activate-$RUN"
@@ -537,16 +661,39 @@ elif [ -n "${FROM_STORE:-}" ] && [ "$MODE" = run ]; then
   # Checked when it was stored and again just now; the cell knows a version by its commit.
   [ "$VENDOR" = "$STORE_VENDOR" ] || fail "the stored package is $VENDOR's, not $STORE_VENDOR's"
   ID=$STORE_COMMIT DIGEST=$FROM_STORE
-  if [ "$TYPE" = workflows ]; then
+  # How prod's workflows and functions go live (#1479): the package's prodRollout, which the customer stack sets on prod's
+  # projects (PROD_ROLLOUT). A production cell's deployer checks it against its list and shifts each alias so, rolled back
+  # by alarms; any other cell switches at once. Any other stage asks for all-at-once (#1607 review): a production cell
+  # that a customer file names as dev or test switches at once for them, as dev and test do everywhere.
+  ROLLOUT="all-at-once"; [ "${STAGE:-}" = prod ] && ROLLOUT=${PROD_ROLLOUT:-}
+  if [ -n "${SWITCH:-}" ]; then
+    [ "$TYPE" = workflows ] || [ "$TYPE" = functions ] || fail "a switch moves one workflow's or function's live alias: only a workflows or functions activation takes SWITCH (#1559, #1560)"
+    # Since the review of #1562 the customer API names the event it wrote first as the last part: the switch is recorded
+    # by it, a pin's or an unpin's. Without it (an older customer API), a pin's by its build.
+    [[ "$SWITCH" =~ ^([a-z0-9][a-z0-9_-]{0,79}):([1-9][0-9]{0,8}):(pin|unpin)(:([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{9}Z-[A-Za-z0-9=_-]{1,64}))?$ ]] \
+      || fail "SWITCH must be <workflow>:<version>:pin|unpin, not '$SWITCH'"
+    SW_NAME=${BASH_REMATCH[1]} SW_VERSION=${BASH_REMATCH[2]} SW_EVENT=${BASH_REMATCH[5]} SW_PIN=false
+    [ "${BASH_REMATCH[3]}" = pin ] && SW_PIN=true
+  fi
+  if [ -n "${SWITCH:-}" ]; then
+    # One workflow's or function's live alias moved (#1559, #1560): the deployer does it with UpdateStateMachineAlias or
+    # Lambda's UpdateAlias, no deploy. The commit and digest are the version's package, which the stage published it from.
+    REQUEST=$(jq -nc --arg t "$TYPE" --arg c "$ID" --arg d "$DIGEST" --arg n "$SW_NAME" --argjson v "$SW_VERSION" --argjson p "$SW_PIN" \
+      '{action: "switch", type: $t, commit: $c, digest: $d, name: $n, version: $v, pin: $p}')
+    if [ "$SW_PIN" = true ]; then WHAT="switch $SW_NAME of $VENDOR/$PACKAGE to v$SW_VERSION on ${STAGE:-the cell} and pin it"
+    else WHAT="move $SW_NAME of $VENDOR/$PACKAGE back to v$SW_VERSION on ${STAGE:-the cell}, its package's, and unpin it"; fi
+  elif [ "$TYPE" = workflows ]; then
     # The cell's workflows deployer builds the workflows stack from the files and deploys it; it answers with the commit
     # as the version, as the intake does. It goes live on deploy: no next boot, so no activate or reason.
-    REQUEST=$(jq -nc --arg c "$ID" --arg d "$DIGEST" '{action: "deploy", type: "workflows", commit: $c, digest: $d}')
+    REQUEST=$(jq -nc --arg c "$ID" --arg d "$DIGEST" --arg r "$ROLLOUT" \
+      '{action: "deploy", type: "workflows", commit: $c, digest: $d} + (if $r == "" then {} else {rollout: $r} end)')
     [ "$ACTIVATE" = now ] && echo "${N}activate: now does not apply to workflows: they go live when the cell deploys them, without a restart"
     WHAT="deploy the workflows of $VENDOR/$PACKAGE $DIGEST @ $ID from the store (${#FILES[@]} files)"
   elif [ "$TYPE" = functions ]; then
     # The cell's functions deployer (#674 step 5) checks the images and their scans (image_scans, below), deploys them
     # and answers with the commit as the version, as the workflows deployer does. No restart: no activate or reason.
-    REQUEST=$(jq -nc --arg c "$ID" --arg d "$DIGEST" '{action: "deploy", type: "functions", commit: $c, digest: $d}')
+    REQUEST=$(jq -nc --arg c "$ID" --arg d "$DIGEST" --arg r "$ROLLOUT" \
+      '{action: "deploy", type: "functions", commit: $c, digest: $d} + (if $r == "" then {} else {rollout: $r} end)')
     [ "$ACTIVATE" = now ] && echo "${N}activate: now does not apply to functions: they go live when the cell deploys them, without a restart"
     WHAT="deploy the functions of $VENDOR/$PACKAGE $DIGEST @ $ID from the store (${#FILES[@]} files)"
   else
@@ -554,12 +701,19 @@ elif [ -n "${FROM_STORE:-}" ] && [ "$MODE" = run ]; then
       '{action: "publish", activate: $a} + (if $r == "" then {} else {reason: $r} end)')
     WHAT="publish $VENDOR/$PACKAGE $DIGEST @ $ID from the store (${#FILES[@]} files)"
   fi
-  [ "${STAGE:-}" = test ] && test_gate
-  [ "${STAGE:-}" = prod ] && prod_gate
-  # The release's order on test (#1477); prod comes with its activations of functions and workflows (#1478).
-  [ "${STAGE:-}" = test ] && release_gate
+  # A switch (#1559) takes a version the stage published already, which the customer API checked: no gate.
+  [ -z "${SWITCH:-}" ] && [ "${STAGE:-}" = test ] && test_gate
+  [ -z "${SWITCH:-}" ] && [ "${STAGE:-}" = prod ] && prod_gate
+  # The release's order on test (#1477) and on prod (#1478): workflows wait for their functions on the same stage.
+  [ -z "${SWITCH:-}" ] && { [ "${STAGE:-}" = test ] || [ "${STAGE:-}" = prod ]; } && release_gate
   # After the gates: a start they refuse waits for no scan.
-  [ "$TYPE" = functions ] && image_scans
+  [ "$TYPE" = functions ] && [ -z "${SWITCH:-}" ] && image_scans
+  # The stage's pins (#1559), after the gates too: the deployer keeps each pinned workflow's live on its pinned version.
+  # Dev's and test's only: prod is never switched, and its activation may not read pins (#1478).
+  if { [ "$TYPE" = workflows ] || [ "$TYPE" = functions ]; } && [ -z "${SWITCH:-}" ] && { [ "${STAGE:-}" = dev ] || [ "${STAGE:-}" = test ]; }; then
+    stage_pins
+    [ "$REPLY" = '{}' ] || REQUEST=$(jq -c --argjson p "$REPLY" '. + {pins: $p}' <<< "$REQUEST")
+  fi
 else
   git rev-parse --git-dir >/dev/null 2>&1 || fail "not a git checkout: the version published is the commit"
   # Functions and workflows take committed files only (and the built zips, checked below): untracked build output, such
@@ -705,7 +859,8 @@ push_images() {
 
 # functions_changed_at (#1477): the last commit, up to this one, that changed what the functions are built from:
 # FUNCTIONS_PATHS (git pathspecs, space-separated), by default everything but workflows/ (a change elsewhere, a README
-# say, only makes the workflows wait for functions that test may well have). A shallow clone's oldest commit seems to
+# say, only makes the workflows wait for functions that test may well have, and stores a package of its own: the safe
+# side; too narrow a value is not, since #1546 a commit with no change there stores nothing). A shallow clone's oldest commit seems to
 # add every file, so a last change found there is not one: it is this commit then, and the workflows wait, never the
 # other way round (GitHub's checkout fetches one commit unless fetch-depth: 0; GitLab 20 by default).
 functions_changed_at() {
@@ -719,6 +874,44 @@ functions_changed_at() {
   if [ -n "$shallow" ] && [ -f "$shallow" ] && grep -qx "$c" "$shallow"; then echo "$ID"; else echo "$c"; fi
 }
 
+# reuse_unchanged_functions (#1546): a commit that did not change its functions (CHANGED_AT names an earlier one) points
+# at the package of that last change instead of storing its own. CI rebuilds the images on every commit, and a rebuild
+# rarely gives the same bytes, so its own package would be another digest: one test does not run, that dev deploys again
+# and the console offers to promote, though nothing in it changed. Only when that commit's package is in the store (a
+# push of several commits stores the tip only) and this commit has no pointer yet (it keeps its first, store_package);
+# never for the extra dev cells, which write no pointer. Returns 1 when the commit stores its own.
+reuse_unchanged_functions() {
+  [ -n "${CHANGED_AT:-}" ] && [ "$CHANGED_AT" != "$ID" ] && [ "${STORE_POINTER:-yes}" != no ] || return 1
+  [ -n "${PACKAGES_BUCKET:-}" ] || fail "PACKAGES_BUCKET is required to store"
+  local mine="$VENDOR/versions/_functions/$PACKAGE/$ID.json" last="$VENDOR/versions/_functions/$PACKAGE/$CHANGED_AT.json" err d
+  if err=$(aws s3api get-object --bucket "$PACKAGES_BUCKET" --key "$mine" "$TMP/mine.json" 2>&1 >/dev/null); then return 1; fi
+  case "$err" in *NoSuchKey*|*"(404)"*|*"Not Found"*) ;; *) fail "the commit's pointer could not be read: $err" ;; esac
+  if ! err=$(aws s3api get-object --bucket "$PACKAGES_BUCKET" --key "$last" "$TMP/last.json" 2>&1 >/dev/null); then
+    case "$err" in *NoSuchKey*|*"(404)"*|*"Not Found"*) return 1 ;; *) fail "the pointer of $CHANGED_AT could not be read: $err" ;; esac
+  fi
+  d=$(jq -r '.digest // empty' "$TMP/last.json" 2>/dev/null)
+  [[ "$d" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "the pointer $last names no digest"
+  # Only a package this pipeline's role stored (#1548 review): another delegation's carries that one's record, which is
+  # refused once it is revoked, or is not a release branch's (#1203), and a pointer is written once. Anything that cannot
+  # tell (not a role, the record unreadable) counts as another's: the commit stores its own, as before #1546.
+  local me publisher=""
+  me=$(aws sts get-caller-identity --query Arn --output text 2>/dev/null) || me=""
+  case "$me" in arn:aws*:sts::*:assumed-role/*/*) publisher=${me#*:assumed-role/}; publisher=${publisher%%/*} ;; esac
+  if ! [[ "$publisher" =~ ^[A-Za-z0-9_.-]+$ ]] \
+     || ! aws s3api get-object --bucket "$PACKAGES_BUCKET" --key "$VENDOR/packages/${d#sha256:}/stored-by/$publisher.json" "$TMP/sb.json" >/dev/null 2>&1; then
+    echo "functions unchanged since $CHANGED_AT, but its package $d was stored by another pipeline: this commit stores its own"
+    return 1
+  fi
+  jq -n --arg d "$d" --arg c "$CHANGED_AT" '{digest: $d, type: "functions", changedAt: $c}' > "$TMP/version.json"
+  printf '%s\0%s\0' "$mine" "$TMP/version.json" | ( BUCKET=$PACKAGES_BUCKET CELL_PROFILE='' upload ) \
+    || fail "the commit's pointer could not be stored"
+  # Two runs at once: only the first pointer counts; report what it names.
+  aws s3api get-object --bucket "$PACKAGES_BUCKET" --key "$mine" "$TMP/mine.json" >/dev/null 2>&1 \
+    && d=$(jq -r '.digest // empty' "$TMP/mine.json" 2>/dev/null)
+  echo "functions unchanged since $CHANGED_AT: $ID points at its package $d; nothing pushed or stored (FUNCTIONS_PATHS: ${FUNCTIONS_PATHS:-everything but workflows/})"
+  DIGEST=$d
+  outcome stored
+}
 store_package() {
   [ -n "${PACKAGES_BUCKET:-}" ] || fail "PACKAGES_BUCKET is required to store"
   [ -z "$VERSION" ] || fail "store stores a commit, not a version (VERSION)"
@@ -768,7 +961,7 @@ store_package() {
   me=$(aws sts get-caller-identity --query Arn --output text 2>/dev/null) || me=""
   case "$me" in arn:aws*:sts::*:assumed-role/*/*) publisher=${me#*:assumed-role/}; publisher=${publisher%%/*} ;; esac
   if [[ "$publisher" =~ ^[A-Za-z0-9_.-]+$ ]]; then
-    jq -n --arg p "$publisher" '{publisher: $p}' > "$TMP/stored-by.json"
+    jq -n --arg p "$publisher" --argjson r "${REPORTED:-$(reported_build)}" '{publisher: $p, reported: $r}' > "$TMP/stored-by.json"
     BUCKET=$PACKAGES_BUCKET CELL_PROFILE= bash "$SELF" __put "$at/stored-by/$publisher.json" "$TMP/stored-by.json" \
       || echo "${W}who stored the package could not be recorded: it is refused once a delegation of $VENDOR is revoked" >&2
   else
@@ -817,6 +1010,7 @@ keep_answer() {
 release() {
   case "$(jq -r '.status // empty' "$TMP/result.json")" in published|activated) ;; *) return 0 ;; esac
   local at="$VENDOR/prod/$PACKAGE" now previous=""
+  [ "$TYPE" = censhare-custom ] || at="$VENDOR/prod/_$TYPE/$PACKAGE"
   now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   aws s3api get-object --bucket "$PACKAGES_BUCKET" --key "$at/current.json" "$TMP/previous.json" >/dev/null 2>&1 \
     && previous=$(jq -r '.digest // empty' "$TMP/previous.json")
@@ -831,8 +1025,41 @@ release() {
     || { echo "${W}prod runs $DIGEST, but current.json could not be written" >&2; return 0; }
   echo "prod release: $DIGEST${previous:+, replaces $previous}"
 }
-# The last change to the functions is read in the checkout, before push_images moves into its staging folder.
-if [ "$MODE" = store ]; then [ "$TYPE" = functions ] && { CHANGED_AT=$(functions_changed_at); push_images; }; store_package; exit 0; fi
+# reported_build (#1539): where the pipeline says it built this commit, as JSON, kept with who stored it. The CI's own
+# variables: GitHub's GITHUB_REPOSITORY and GITHUB_REF; GitLab's CI_PROJECT_PATH and CI_COMMIT_TAG or CI_COMMIT_BRANCH;
+# the customer's CodeCommit template's SOURCE_REPOSITORY, with SOURCE_BRANCH from deliver.sh. The commit is the one
+# built and stored ($ID), not the CI's own SHA, which can name another (actions/checkout with a ref of its own, #1585
+# review). onMain: whether origin/main has that commit, only when the checkout can tell (origin/main fetched, not a
+# shallow clone) and git answers yes or no. The pipeline's word, which the Solution Console shows as reported: who
+# stored the package is what proves its ref, and nothing here allows or refuses anything. A value that is no repository
+# or ref is left out. Run in the checkout: the store reads it before push_images moves into its staging folder.
+reported_build() {
+  local repo="" ref=""
+  if [ -n "${GITHUB_REPOSITORY:-}" ]; then repo=$GITHUB_REPOSITORY; ref=${GITHUB_REF:-}
+  elif [ -n "${CI_PROJECT_PATH:-}" ]; then
+    repo=$CI_PROJECT_PATH
+    if [ -n "${CI_COMMIT_TAG:-}" ]; then ref="refs/tags/$CI_COMMIT_TAG"; elif [ -n "${CI_COMMIT_BRANCH:-}" ]; then ref="refs/heads/$CI_COMMIT_BRANCH"; fi
+  elif [ -n "${SOURCE_REPOSITORY:-}" ]; then repo=$SOURCE_REPOSITORY; [ -n "${SOURCE_BRANCH:-}" ] && ref="refs/heads/$SOURCE_BRANCH"
+  fi
+  [[ "$repo" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]] && [ ${#repo} -le 200 ] || repo=""
+  [[ "$ref" =~ ^refs/(heads|tags)/[A-Za-z0-9._/-]+$ ]] && [ ${#ref} -le 200 ] || ref=""
+  local commit=$ID on="" rc=0
+  if git rev-parse -q --verify refs/remotes/origin/main >/dev/null 2>&1 && [ "$(git rev-parse --is-shallow-repository 2>/dev/null)" = false ]; then
+    # 0 is yes, 1 is no; anything else (128: an object the checkout lacks) is no answer, so onMain is left out.
+    git merge-base --is-ancestor "$commit" refs/remotes/origin/main 2>/dev/null || rc=$?
+    case $rc in 0) on=true ;; 1) on=false ;; esac
+  fi
+  jq -nc --arg r "$repo" --arg f "$ref" --arg c "$commit" --arg o "$on" \
+    '(if $r == "" then {} else {repository: $r} end) + (if $f == "" then {} else {ref: $f} end) + {commit: $c}
+     + (if $o == "" then {} else {onMain: ($o == "true")} end)'
+}
+# The last change to the functions, and where the pipeline says it built, are read in the checkout, before push_images
+# moves into its staging folder (#1585 review: there, git could not tell whether the commit is on main).
+if [ "$MODE" = store ]; then
+  REPORTED=$(reported_build)
+  if [ "$TYPE" = functions ]; then CHANGED_AT=$(functions_changed_at); reuse_unchanged_functions && exit 0; push_images; fi
+  store_package; exit 0
+fi
 
 # The cell's answer in BASE, once it has given one.
 answer() {
@@ -887,20 +1114,39 @@ elif [ -z "$VERSION" ] && answer; then
     *) echo "the cell answered this commit before; a refused commit is not sent again (commit a fix):" ;;
   esac
 else
-  send "$([ -z "$VERSION" ] && echo 1 || echo 0)"
+  # A switch (#1559) sends its request alone: the versions are in the cell already.
+  send "$([ -z "$VERSION" ] && [ -z "${SWITCH:-}" ] && echo 1 || echo 0)"
 fi
 
 # A stored package's answer must be its own: a success names the version it published or activated. One for another
 # version was left in that folder for another request, and is never kept as this stage's answer or prod's release.
 if [ -n "${FROM_STORE:-}" ]; then
-  case "$(jq -r '.status // empty' "$TMP/result.json")" in published|activated)
+  case "$(jq -r '.status // empty' "$TMP/result.json")" in published|activated|switched)
     [ "$(jq -r '.version // empty' "$TMP/result.json")" = "$STORE_COMMIT" ] \
       || fail "the answer in $BASE is for $(jq -r '.version // "no version"' "$TMP/result.json"), not $STORE_COMMIT; nothing recorded" ;;
   esac
 fi
-keep_answer
-# A workflows package records no prod release: prod's current.json and history are a customization's (#1104 review).
-[ "${STAGE:-}" = prod ] && [ -n "${FROM_STORE:-}" ] && [ "$TYPE" = censhare-custom ] && release
+# A switch that went through is recorded next to its event (review of #1562): the pin or unpin counts only then, for
+# the customer API and for every later deploy (stage_pins). One the cell refused records nothing. By the event it names;
+# from an older customer API, a pin's by its build.
+if [ -n "${SWITCH:-}" ] && [ "$(jq -r '.status // empty' "$TMP/result.json")" = switched ]; then
+  sw_id=""
+  if [ -n "${SW_EVENT:-}" ]; then sw_id=$SW_EVENT
+  elif [ "${SW_PIN:-}" = true ] && [[ "${CODEBUILD_BUILD_ID:-}" =~ :([A-Za-z0-9-]{1,64})$ ]]; then sw_id=${BASH_REMATCH[1]}
+  elif [ "${SW_PIN:-}" = true ]; then echo "${W}no build id (CODEBUILD_BUILD_ID): the switch went through, but its pin does not count until it is switched again" >&2
+  fi
+  if [ -n "$sw_id" ]; then
+    jq -n --argjson v "$SW_VERSION" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{status: "switched", live: $v, at: $at}' > "$TMP/switched.json"
+    BUCKET=$PACKAGES_BUCKET CELL_PROFILE='' bash "$SELF" __put "$STORE_VENDOR/pins/$STAGE/$TYPE/$SW_NAME/switched/$sw_id.json" "$TMP/switched.json" \
+      || echo "${W}the switch went through, but could not be recorded: it does not count until it is switched again" >&2
+  fi
+fi
+# A switch's answer is no deploy's (#1559): the stage's answer for the digest stays the deploy's, which says which
+# version each workflow got.
+[ -z "${SWITCH:-}" ] && keep_answer
+# Each type's prod release is its own (#1478): a workflows or functions package's under prod/_<type>/<package>/, never
+# the customization's prod/<package>/ (#1104 review). A switch is never prod's.
+[ -z "${SWITCH:-}" ] && [ "${STAGE:-}" = prod ] && [ -n "${FROM_STORE:-}" ] && release
 STATUS=$(jq -r '.status // "unknown"' "$TMP/result.json")
 output status "$STATUS"
 outcome "$STATUS" --arg activation "$(jq -r '.activation // empty' "$TMP/result.json")" \
@@ -910,7 +1156,7 @@ jq -r '"status:     \(.status)", (if .version then "version:    \(.version)" els
        (if .activation then "activation: \(.activation)" else empty end), (if .note then "note:       \(.note)" else empty end),
        (if .reason then "reason:     \(.reason)" else empty end), (.validator // [] | .[] | "  \(.)")' "$TMP/result.json"
 case "$STATUS" in
-  published|activated)
+  published|activated|switched)
     summary "### ✅ $WHAT" "" "$(jq -r '[.status, .activation // empty, .note // empty] | join(" — ")' "$TMP/result.json")"
     exit 0 ;;
   *)

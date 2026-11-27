@@ -46,5 +46,19 @@
       "pattern": "^1-[0-9a-f]{8}-[0-9a-f]{24}$",
       "description": "The X-Ray trace id the server gave the event when it published it (#1088). EventBridge passes it on to the run the event starts, and the server log line for the event names it too."
     }
-  }
+  },
+  "examples": [
+    {
+      "version": 1,
+      "schema": "corpus",
+      "table": "party",
+      "added": 0,
+      "modified": 1,
+      "removed": 0,
+      "ids": [
+        10045
+      ],
+      "correlationId": "1-6744a1b2-0123456789abcdef01234567"
+    }
+  ]
 }

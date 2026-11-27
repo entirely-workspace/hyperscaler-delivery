@@ -66,5 +66,22 @@
       "description": "The X-Ray trace id the server gave the event when it published it (#1088). EventBridge passes it on to the run the event starts, and the server log line for the event names it too."
     }
   },
-  "additionalProperties": true
+  "additionalProperties": true,
+  "examples": [
+    {
+      "version": 1,
+      "assetId": 18342,
+      "assetVersion": 4,
+      "userId": 10021,
+      "name": "Spring catalogue cover",
+      "type": "picture.",
+      "domain": "root.solution-admin.organization.media.",
+      "domain2": "root.",
+      "workflowId": 10,
+      "workflowStep": 30,
+      "correlationId": "1-6744a1b2-0123456789abcdef01234567",
+      "previousWorkflowId": 10,
+      "previousWorkflowStep": 20
+    }
+  ]
 }

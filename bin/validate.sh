@@ -14,15 +14,15 @@
 # deploy's own checks (lib/workflow-validate-cli.ts; in the kit compiled into lib/, with the event schemas in
 # docs/events/), which needs Node. A functions package (#674), a folder with functions/functions.json and neither of the
 # others, is checked by the functions validator (lib/function-validate-cli.ts): the deploy's rules for functions.json,
-# and each function's zip, which the customer's CI built before (there, a regular file, a zip, at most 250 MB
-# unpacked). PACKAGE_TYPE (censhare-custom, workflows or functions) says which when the folder has more than one.
+# and each function's image, built before for linux/arm64 (Docker, at most 10 GB). PACKAGE_TYPE (censhare-custom,
+# workflows or functions) says which; with workflows/ there, the functions are checked only with PACKAGE_TYPE=functions.
 #
 # Exit: 0 passes (warnings are printed), 1 refused (the reasons are printed), 2 could not check.
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 DIR=.
 [ $# -gt 0 ] && [ "${1#-}" = "$1" ] && { DIR=$1; shift; }
-case "${1:-}" in -h|--help) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;; esac
+case "${1:-}" in -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;; esac
 fail() { echo "error: $*" >&2; exit 2; }
 case "${PACKAGE_TYPE:-}" in
   "") if [ -f "$DIR/customization.json" ] && [ -f "$DIR/workflows/workflows.json" ]; then

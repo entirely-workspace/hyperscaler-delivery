@@ -4,6 +4,12 @@
 pull-back.sh --cell runs it; in the partner kit it is bin/cell-capture.py, next to bin/pull-back.sh. Standard library only.
 
     cell-capture.py --cell https://<cell>/solution-console/ --out <zip> [--capture] [--follows <json>]
+    cell-capture.py --cell https://<cell>/solution-console/ --out <json> --workflows
+
+With --workflows (#1597, pull-back-workflows.sh), steps 1 and 2 as below, then the workflows' and functions' live
+changes as the Local changes tab's Workflows side has them (GET /portal/workflow-changes/export): the changed
+definitions with the cell's values turned back into placeholders, and the changed functions' memory and timeout, as
+JSON into --out. Exit 3 when nothing differs.
 
 1. Reads https://<cell>/solution-console/cli.json, which scripts/publish-app.sh writes with the console: the cell's login
    address, the Solution Console's app client, its identity provider, the cell's API. Nothing in it is a secret.
@@ -30,7 +36,8 @@ pull-back.sh --cell runs it; in the partner kit it is bin/cell-capture.py, next 
    written otherwise, and a read that fails stops nothing.
 
 Without --capture it refuses a newest capture that no longer says what differs: the cell booted another release since,
-or its live status lists other changes. Who may is the Local changes tab's rule, which the cell applies.
+its live status lists other changes, or a file's sha256 there differs from the capture's (edited again since, #1442).
+Who may is the Local changes tab's rule, which the cell applies.
 
 Exit: 0 the zip is at --out; 1 refused (the reason is printed); 2 could not run; 3 the cell is in sync, nothing to get.
 """
@@ -365,6 +372,21 @@ def changed_set(x):
     return files, bool((x.get('settings') or {}).get('ingest'))
 
 
+def changed_again(live, latest):
+    """The files edited again since the capture (#1442): listed in both under the same path, the live status with another
+    sha256. A file without both digests (a bridge before #1442; a file larger than a capture carries, or left when the
+    bridge's minute ran out) is never claimed; whether those were edited again is not known."""
+    def digests(x):
+        return {f.get('path'): f.get('sha256') for f in (x.get('files') or []) if isinstance(f, dict)}
+    then, now = digests(latest), digests(live)
+    unknown = [p for p in now if not now[p] or not then.get(p)]
+    if unknown:
+        # Either side may lack one: the live status (an older bridge) or the capture (an older format).
+        print(f'note: no digest to compare for {len(unknown)} file(s), so whether a file was edited again since the '
+              'capture is not known for those: run with --capture when in doubt', file=sys.stderr)
+    return sorted(p for p in now if now[p] and then.get(p) and now[p] != then[p])
+
+
 def when(x):
     """An ISO time as an aware datetime, or None."""
     try:
@@ -391,8 +413,18 @@ def stale_reason(answer):
         return None
     if live.get('inSync'):
         return 'in-sync'
+    cut = max(int(x.get('filesCut') or 0) for x in (live, latest))
+    if cut:
+        # The cell's function lists at most MAX_FILES files (#1577 review): those past it are not compared, by path or
+        # digest, so whether they changed since the capture is not known.
+        print(f'note: the cell lists only the first {len(live.get("files") or [])} of {cut} changed files, so the ones past '
+              'them are not compared with the capture: run with --capture when in doubt', file=sys.stderr)
     if changed_set(live) != changed_set(latest):
         return 'the cell\'s live changes differ from that capture now'
+    again = changed_again(live, latest)
+    if again:
+        more = f' and {len(again) - 3} more' if len(again) > 3 else ''
+        return f'{", ".join(again[:3])}{more} changed again since that capture'
     return None
 
 
@@ -402,16 +434,33 @@ def main():
     ap.add_argument('--out', required=True)
     ap.add_argument('--capture', action='store_true')
     ap.add_argument('--follows')
+    ap.add_argument('--workflows', action='store_true')
     a = ap.parse_args()
+    if a.workflows and (a.capture or a.follows):
+        raise Failed('--workflows takes neither --capture nor --follows')
     cfg = cell_config(a.cell)
     bearer = sign_in(cfg)
     check_token(cfg, bearer)
+    if a.workflows:
+        return take_workflows(cfg, bearer, a.out)
     rc = take(cfg, bearer, a)
     key = source_key(cfg, a.out) if rc == 0 and a.follows and cfg.get('customerApi') else None
     if key:
         with open(a.follows, 'w') as fh:
             json.dump(follows(cfg, bearer, key), fh)
     return rc
+
+
+def take_workflows(cfg, bearer, out):
+    """The workflows' live changes into out (#1597): 0, or 3 when nothing differs that goes back to git."""
+    api = cfg['api'].rstrip('/')
+    x = get_json(f'{api}/portal/workflow-changes/export', bearer)
+    if not isinstance(x, dict) or not isinstance(x.get('flows'), list) or not isinstance(x.get('functions'), list):
+        raise Failed('the cell answered its workflows\' changes in a form this kit does not read')
+    with open(out, 'w') as fh:
+        json.dump(x, fh)
+    taken = [f for f in x['flows'] if 'definition' in f] + [f for f in x['functions'] if 'memoryMb' in f or 'timeoutSeconds' in f]
+    return 0 if taken or any('refused' in f for f in x['flows']) else 3
 
 
 def take(cfg, bearer, a):

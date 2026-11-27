@@ -1,0 +1,11 @@
+{
+  "vendor": "your-vendor",
+  "package": "your-package",
+  "source": "censhare-Custom/censhare-Server",
+  "owns": ["app/modules/your-vendor"],
+  "censhareVersion": ">=2026.2",
+  "hyperscalerContract": 1,
+  "activation": "boot",
+  "touchesMasterdata": false,
+  "arch": "any"
+}

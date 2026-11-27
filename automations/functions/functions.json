@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "vendor": "your-vendor",
+  "package": "your-automations",
+  "functions": [
+    {
+      "name": "hello",
+      "image": "hello",
+      "description": "An example the example workflow calls: answers a greeting. Replace it with your own functions.",
+      "memoryMb": 512,
+      "timeoutSeconds": 10,
+      "concurrency": 1
+    }
+  ]
+}

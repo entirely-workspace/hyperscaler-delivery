@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "vendor": "your-vendor",
+  "package": "your-automations",
+  "flows": [
+    {
+      "name": "example",
+      "description": "A placeholder so the first push delivers: it calls the example function, and is started only by a custom.example event, which nothing sends. Replace it with your own workflows.",
+      "definition": "example.asl.json",
+      "trigger": { "source": "censhare.server", "event": "custom.example" },
+      "timeoutMinutes": 1
+    }
+  ]
+}

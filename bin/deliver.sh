@@ -215,6 +215,17 @@ tip
 if [ "$PACKAGE_TYPE" = functions ]; then
   [ -f "$HERE/validate.sh" ] || fail "validate.sh is not next to $0: functions are not stored unchecked"
   git diff --quiet HEAD -- functions/functions.json 2>/dev/null || fail "functions/functions.json differs from the commit: commit it first"
+  # A delivery with no CI of its own to build the images (a CodeCommit build with Functions=yes, #1526) builds them here,
+  # from functions/<image>/, so the check reads them like ones the customer's CI built.
+  if [ "${BUILD_IMAGES:-}" = yes ]; then
+    [ -f "$HERE/build-images.sh" ] || fail "build-images.sh is not next to $0: the functions' images cannot be built"
+    bash "$HERE/build-images.sh" functions/functions.json
+    case $? in
+      0) ;;
+      1) echo "error: a function's image could not be built (above): nothing was stored" >&2; exit 1 ;;
+      *) fail "the functions' images could not be built (above): nothing was stored" ;;
+    esac
+  fi
   # An image from the customer's own registry (#1412) is pulled first, with this run's registry login, so the check
   # reads it like one built in the run.
   [ -f "$HERE/pull-images.sh" ] || fail "pull-images.sh is not next to $0: an image from a registry cannot be pulled"
@@ -256,13 +267,15 @@ else
 fi
 
 # 1. Stored once, by digest: the same checks as any publish (committed files only, no symlinks).
-OUTCOME_FILE="$TMP/stored.json" bash "$HERE/publish.sh" store || exit 2
+SRC_BRANCH=; [ -n "$TAG" ] || SRC_BRANCH=${BRANCH:-}  # a tag is no branch: reported without one
+# The store keeps where the push came from too (#1539): the CodeCommit template sets BRANCH, not SOURCE_BRANCH, so it
+# is passed here, or a CodeCommit build would report no ref (#1585 review). GitHub and GitLab report their own.
+SOURCE_BRANCH=$SRC_BRANCH OUTCOME_FILE="$TMP/stored.json" bash "$HERE/publish.sh" store || exit 2
 DIGEST=$(jq -r .digest "$TMP/stored.json") VENDOR=$(jq -r '.package | split("/")[0]' "$TMP/stored.json")
 
 # 2. Activated in the stage's cell by digest, or in each extra dev cell that follows this branch (#1189). The publisher
 # role may pass FROM_STORE, ACTIVATE and REASON, and where the push came from (SOURCE_REPOSITORY, SOURCE_BRANCH). As
 # JSON: the CLI's shorthand splits on commas, so a reason with one would break the call.
-SRC_BRANCH=; [ -n "$TAG" ] || SRC_BRANCH=${BRANCH:-}  # a tag is no branch: reported without one
 overrides=$(jq -nc --arg d "$DIGEST" --arg a "${ACTIVATE:-}" --arg r "${REASON:-}" --arg sr "${SOURCE_REPOSITORY:-}" --arg sb "$SRC_BRANCH" \
   '[{name: "FROM_STORE", value: $d}] + (if $a == "" then [] else [{name: "ACTIVATE", value: $a}] end)
      + (if $r == "" then [] else [{name: "REASON", value: $r}] end)

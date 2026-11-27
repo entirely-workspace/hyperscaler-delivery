@@ -4,7 +4,7 @@ description: >
   package store, by digest, and activates it in the delegated stage's cell (dev or test), then reports the cell's
   answer. It signs in as the publisher role the customer delegated to this repository and branch: the workflow needs
   `permissions: id-token: write`, and no key is stored anywhere. Prod is never delivered by a pipeline; it takes the
-  customer's approval. See README.md.
+  customer's approval. Inputs: REFERENCE.md; how to start: README.md.
 inputs:
   customer:
     description: The customer id censhare gave you.

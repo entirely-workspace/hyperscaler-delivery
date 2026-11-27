@@ -1,8 +1,9 @@
 # Partner guide: delivering customizations to censhare HyperScaler
 
 This guide is for partners who build censhare customizations, and for the customers they work for. It covers the
-whole path: from a commit in your git to the customer's cells, and back out when something goes wrong. For wiring up
-your pipeline, see [README.md](README.md).
+whole path: from a commit in your git to the customer's cells, and back out when something goes wrong. To set up your
+repository, start from your git's example ([README.md](README.md)); every field, variable and command is in
+[REFERENCE.md](REFERENCE.md).
 
 ## How it works
 - **Your source stays with you.** You keep it in your own git and build with your own CI. censhare never receives a
@@ -18,9 +19,11 @@ your pipeline, see [README.md](README.md).
 ## Ways in, by what you have
 | You have | Your way in |
 |---|---|
-| GitHub, or GitLab on gitlab.com, with CI | Copy the kit's `starter/`, rename the package, set three variables (four if test is delegated too), and push. Each push to the delegated branch delivers. See [README.md](README.md). |
-| Another CI with OIDC sign-in to AWS | The same kit, without the Action: `bin/deliver.sh` with `--publisher-role`. See README, "Without the Action". |
-| No CI of your own | The customer can host the repository in AWS CodeCommit, in their own AWS account, where a ready-made pipeline delivers each push. Ask censhare to set it up with the customer. |
+| GitHub, with Actions | Copy [github/](github/README.md), rename the package, set the variables, and push. Each push to the delegated branch delivers. |
+| GitLab on gitlab.com, with CI | Copy [gitlab/example/](gitlab/example/README.md), the same way. |
+| Workflows and functions | Copy [automations/](automations/README.md), a repository of its own next to the customization's. |
+| Another CI with OIDC sign-in to AWS | The same kit, without the Action: `bin/deliver.sh` with `--publisher-role` ([REFERENCE.md](REFERENCE.md#commands)). |
+| No CI of your own | The customer can host the repository in AWS CodeCommit, in their own AWS account, where a ready-made pipeline delivers each push. Ask censhare to set it up with the customer ([codecommit/](codecommit/README.md)). |
 | No delivery work on your side at all | censhare professional services can build and deliver the package for the customer, through the same path. |
 
 **Not offered yet:**
@@ -53,7 +56,9 @@ Until then, mirror the repository to gitlab.com or GitHub, or use CodeCommit.
 4. **Set the values as CI variables, then push:** `CENSHARE_CUSTOMER`, `CENSHARE_PACKAGES_BUCKET`,
    `CENSHARE_PUBLISHER_ROLE`, and `CENSHARE_PUBLISHER_ROLE_TEST` for `test`'s role. Set them before your first push,
    since the first push delivers. On GitLab, leave them unprotected unless the branch is protected: a protected
-   variable is empty on any other branch.
+   variable is empty on any other branch. If the customer delegates its extra dev cells to you too, you also get
+   `CENSHARE_DEV_CELLS_ROLE`. All of them, with where to set them, are in your example's README and in
+   [REFERENCE.md](REFERENCE.md#variables). On CodeCommit there's nothing to set: the customer's pipeline has them.
 
 ## Delivering a change
 - **Push to the delegated branch.** The pipeline:
@@ -80,18 +85,70 @@ Until then, mirror the repository to gitlab.com or GitHub, or use CodeCommit.
   (`docker login`, or `docker/login-action`; on GitHub, `GITHUB_TOKEN` with `packages: read` reads GHCR). Your login
   stays in your CI: censhare never sees it and never contacts your registry. A tag is refused: a tag can move, a digest
   cannot. One `functions.json` may mix both kinds.
+  **From CodeCommit**, with no CI of your own to build the images (#1526): the customer deploys the CodeCommit template
+  with `Functions=yes`, and its build builds each image you name plainly (`"image": "checks"`) from `functions/checks/`
+  (its `Dockerfile`), for linux/arm64, after `functions/build.sh` if you have one (to package a Java function, say), then
+  goes on as above. Start each `Dockerfile` from AWS's Lambda base images on `public.ecr.aws`
+  (`public.ecr.aws/lambda/python`, `…/java`, `…/nodejs`), not Docker Hub's (`python:…`, `node:…`): the build
+  pulls anonymously from shared addresses, and Docker Hub's rate limit can then fail a delivery (429). Workflows
+  alone need no `Functions=yes`: they may call functions delivered another way, by their names in a
+  `functions.json` at the repository's root.
   A function workflows call needs no `triggers`: a workflow calls it directly (`lambda:invoke` on
   `${function:<name>}`, docs/FUNCTIONS-CONTRACT.md §2). To let callers outside the workflows reach it too (censhare,
   a person, another system), add `"triggers": [{ "type": "http", "path": "/solution/functions/<route>" }]`:
   it answers at `POST https://<cell>/solution/functions/<route>`, your cell's own address, to a person's or an
   automation's token, and gets
   API Gateway's HTTP event (docs/FUNCTIONS-CONTRACT.md, "Over HTTP").
+  To run it on censhare's events or on a schedule, add an `event` or `schedule` trigger:
+  `{ "type": "event", "detailTypes": ["asset.changed"], "filter": { "type": ["product."], "domain": ["root.marketing."] } }`
+  runs it for each change of a product asset in that domain (the filter is applied before your function runs, so other
+  changes cost nothing), and `{ "type": "schedule", "cron": "0 2 * * ? *", "timezone": "Europe/Berlin" }` every night
+  at 2 in Berlin. The detail types and filter members are censhare's event catalogue's (docs/EVENTS.md); a value of
+  `type` or `domain` ends with a dot, `{ "prefix": "root.marketing." }` takes a whole subtree. Your function gets the
+  same HTTP event as on a route, with the event (or the schedule's message) as its body and a token of the cell's
+  workflows' login, and runs as the workflows do (docs/FUNCTIONS-CONTRACT.md, "On an event or a schedule"). A message
+  may come twice, so make the work safe to repeat. It shares that login with the cell's workflows, so neither starts
+  the other on a change it made: a change your function makes starts no workflow, and a workflow's change does not start
+  your function. Its own changes don't start it again (set `"includeOwnWrites": true`
+  if they should; `asset.deleted`, `relation.*` and `masterdata.changed` don't say who made a change, so a trigger on
+  them needs `"includeOwnWrites": true`, and your function must not cause them itself). A call that fails, or answers
+  400 or more, is tried five times, then kept in the function's
+  dead-letter queue, which pages the cell's operators; ask them to send it back once your fix is delivered. So answer
+  2xx for an event your function skips or cannot act on (an asset deleted a second later): only a retry that can
+  succeed should fail.
+  To let a partner's system call it (a marketing tool, a DAM, a PIM, anything without a censhare login), add
+  `{ "type": "webhook", "path": "/solution/hooks/<route>" }`: it answers at `POST https://<cell>/solution/hooks/<route>`
+  to calls signed with the function's secret, as [Standard Webhooks](https://www.standardwebhooks.com) signs them
+  (`webhook-id`, `webhook-timestamp`, `webhook-signature`; libraries exist for most languages). An unsigned call, a wrong
+  signature, one older than five minutes, or a `webhook-id` with a `.` in it is refused with 401 before your function
+  runs. The secret is set on each
+  cell, never in your repository: the customer's admin generates it in the Solution Console (Environment values,
+  "Webhook secrets") and gives it to the partner, or pastes the one the partner's tool made, for each cell apart
+  (docs/FUNCTIONS-ON-LAMBDA.md, "Webhook triggers"). Each webhook gets a secret of its own, never one used on another:
+  the signature covers the id, the time and the body but not the address, so a call signed for one webhook would be
+  accepted by the other within those five minutes. Your function gets the same HTTP event as on a route, the
+  partner's body as it came and a token of the cell's workflows' login, and its answer goes back to the partner. The
+  same call may come twice within those five minutes: `webhook-id` tells a repeat (a function on the censhare Java
+  runtime gets the body alone, which must be JSON, so it tells a repeat by the body). Whoever has the secret can call your
+  function with any body, and it runs with the workflows' rights: check the body and do only what the webhook is for.
+  A partner with its own login (an OpenID Connect issuer: Okta, Entra ID, Auth0, Cognito ...) can call with its token
+  instead of a secret: add `"auth": "jwt", "issuer": "<its issuer>", "audience": "<what its tokens are for>"` and, if
+  its tokens carry one, `"scope": "<the scope to require>"`. Nothing is kept on the cell. The partner's tokens must live
+  60 minutes or less: some issuers' defaults are longer (check the access-token lifetime of the partner's app in Entra
+  ID or Auth0), and a longer one is refused with the same 401 as any other (docs/FUNCTIONS-ON-LAMBDA.md, "Webhook
+  triggers").
+  A workflow can be started by a webhook too: in `workflows/workflows.json`, give the flow
+  `"trigger": { "type": "webhook", "path": "/solution/hooks/<route>" }` (or `"auth": "jwt"` as above). The call is
+  checked the same way; the partner is answered 202 with the run's name at once, and the run gets the partner's JSON
+  body as `$.detail` and the `webhook-id` as `id` (with a partner's login, an id made of the caller and the
+  `webhook-id`), so `dedupe` works as for an event. The same `webhook-id` sent again
+  starts no second run. A path is one function's or one flow's, never both.
   To remove a function that a deployed workflow calls, remove the calls first, in a push that still has the function,
   then the function in a later push. The functions go first, so a push that drops both is refused.
   On test, the workflows of a commit wait until test has taken your functions as of the last commit that changed them,
   so a push that only changes workflows doesn't wait for functions nobody promotes. "Changed" means anything outside
   `workflows/` by default; set `FUNCTIONS_PATHS` (git paths, for example `functions src`) in your CI to name what the
-  functions are built from. This needs your history: the starter checks out with `fetch-depth: 0`. A shallow clone
+  functions are built from. This needs your history: the GitHub examples check out with `fetch-depth: 0`. A shallow clone
   works too, but then every push's workflows wait for that push's functions.
 - **When it takes effect.** By default, the cell takes the package at its next restart (`next-boot`). `now` restarts
   the customer's server straight away, so it needs a reason, which is kept in the cell's record. Warn the people
@@ -111,7 +168,8 @@ follows a repository and a branch that its developer chooses in that cell's Solu
   `CENSHARE_DEV_CELLS_ROLE`. It trusts any branch of your repository, but it may only store the package and read which
   cell follows which branch. Each extra dev cell has its own role, which trusts only the branch the cell follows, and
   only that role can start the cell. Your pipeline's OIDC token proves the branch, so nothing here can be pointed at a
-  cell by editing the pipeline on another branch.
+  cell by editing the pipeline on another branch. GitHub Enterprise Server and GHE.com work the same way, once the
+  customer's delegation names your host.
 - **Nothing is promoted from an extra dev cell.** Test and prod still take what dev accepted.
 - **"does not trust ... save its source again"**: the cell's record says it follows your branch, but its role does
   not trust that branch. The customer's developer saves the cell's source again in its Solution Console.
@@ -120,7 +178,7 @@ follows a repository and a branch that its developer chooses in that cell's Solu
 | Stage | Who moves a package there | What it takes |
 |---|---|---|
 | dev | your pipeline, on a push to `main` | a package that passes the check |
-| test | your pipeline on `test`, if test is delegated to you; otherwise the customer's developer, in the Solution Console | **a package dev already accepted**, for the same commit, if the customer has a dev stage: deliver to dev first, then push the same commit to `test`. Without a dev stage, test takes the package as it is. |
+| test | your pipeline on `test`, if test is delegated to you; otherwise the customer's developer, in the Solution Console | **a package dev already accepted**, for the same commit, if the customer has a dev stage: deliver to dev first, then push the same commit to `test`. Without a dev stage, test takes the package as it is. Either way, only a build of the customer's release refs (`main`, unless the customer names others) reaches test; a customer who delegates test to your `test` branch lists both. A customer may also list hotfix branches (`refs/heads/hotfix/*`): their builds reach test too, and the Solution Console marks them as not from `main` until `main` delivers the same code. |
 | prod | the customer's release owner, in the Solution Console | a package test accepted, which the release owner approves and then puts live |
 
 A promotion moves the same digest. What goes live in prod is byte for byte what test accepted.
@@ -162,11 +220,11 @@ your git shows them. The cell's Settings › Customizations page says whether th
    the command the Local changes tab shows. It opens the cell's sign-in in your browser (the Solution Console's, with
    the same access as the tab), takes the cell's newest capture, and records the download under your name. `--capture`
    captures the cell first and takes that capture; without it, a newest capture the cell has changed since is refused.
-   That check sees which files changed, not their content: a file edited again after the capture isn't noticed, so use
-   `--capture` when in doubt. Before you sign in it checks with the cell's own sign-in that the address you gave is
-   that cell's (a look-alike address is refused), and it names the API your sign-in goes to. Your sign-in stays in memory
-   for the run and is never written to disk. With a zip you downloaded or exported, use
-   `--from capture-<cell>-<time>.zip` instead. It:
+   That check also sees a file edited again after the capture, by its content's digest, and names it; on a cell whose
+   admin bridge is older it compares the files' names only, and says so. Before you sign in it checks with the cell's
+   own sign-in that the address you gave is that cell's (a look-alike address is refused), and it names the API your
+   sign-in goes to. Your sign-in stays in memory for the run and is never written to disk. With a zip you downloaded or
+   exported, use `--from capture-<cell>-<time>.zip` instead. It:
    - starts a branch `pullback/<cell>/<vendor>/<package>/<yyyymmdd-hhmmss>` from the commit the cell runs, so the pull request holds
      only the live changes, and a later change to the same file on your branch is a conflict there, never lost. That
      commit must be on the branch the pull request goes into;
@@ -190,6 +248,17 @@ always goes into the default branch, by a pull request. `--package` picks the pa
 cell runs several, and one capture goes into one package; `--no-push` only commits. censhare never writes to your git.
 Master data (`app/masterdata/`) is never pulled back: a package carries it only with `"touchesMasterdata": true`.
 
+**Workflows and functions changed live** (a state machine saved in the AWS console or Workflow Studio, a function's
+memory or timeout changed in the Lambda console) are on the same tab's **Workflows** side. In your clone of the
+automations repository, the kit's `bin/pull-back-workflows.sh` takes them back:
+`bash /tmp/censhare-kit/bin/pull-back-workflows.sh --cell https://<cell>/solution-console/ [--into <branch>]`.
+- It writes them into the files `workflows.json` names and into `functions/functions.json`, on a branch from the
+  commit the cell was delivered from, with the cell's own values turned back into placeholders: `${function:<name>}`,
+  `${bus}`, `${censhare}`, `${censhare-login}`.
+- An image or an environment variable changed live is named, not taken back: the image is built from your repository.
+- A function's `concurrency` changed in the AWS console is not seen at all: Lambda keeps no delivered value to compare
+  with. Change it in `functions.json`; the next delivery sets it back to that.
+
 ## When something fails
 | You see | It means | Do |
 |---|---|---|
@@ -200,6 +269,8 @@ Master data (`app/masterdata/`) is never pulled back: a package carries it only 
 | `Not authorized to perform sts:AssumeRoleWithWebIdentity` | This repository, branch or role isn't the delegated one | Check that the branch is the delegated one and the role variable is that branch's role |
 | `Set the CI/CD variable` (GitLab) or `Set the repository variable` (GitHub), naming `CENSHARE_PUBLISHER_ROLE`, or `CENSHARE_PUBLISHER_ROLE_TEST` on `test` | That branch's role variable is missing, or empty on this branch | Set it. On GitLab, check that it isn't protected. |
 | `dev has not accepted` | A promotion to test of a package dev never accepted | Deliver that commit to dev first |
+| Test refuses the package as no release branch's build | Test takes only builds of the customer's release refs (`main` unless the customer names others) | Merge to `main`, deliver, and promote that build |
+| The Solution Console shows no "on main" or "not on main" beside your build | The kit records it only when your checkout has `origin/main` and is not shallow | Fetch `main` with full history before the kit's step (GitHub: `actions/checkout` with `fetch-depth: 0`); it is shown as reported, and changes nothing about what reaches test |
 | The cell refused the package, with a reason | The cell's own checks refused it: a collision with another package, a missing setting or a missing asset | Fix it and push again. Ask the customer if it's their setting. |
 | Green, but "superseded" | A newer push is delivering | Nothing to do |
 | `runs several packages` (pull-back) | The cell runs more than one package | Name the one the changes belong in with `--package` |
